@@ -1,6 +1,7 @@
 const { describe, test } = require("node:test");
 const assert = require("node:assert");
 const dayjs = require("dayjs");
+const NotificationProvider = require("../../server/notification-providers/notification-provider");
 const { UP, DOWN, MAINTENANCE } = require("../../src/util");
 dayjs.extend(require("dayjs/plugin/utc"));
 
@@ -371,5 +372,29 @@ describe("Slow-ping state machine", () => {
 
         assert.strictEqual(calls.length, 0);
         assert.strictEqual(tracker.state.slowPingStart, null);
+    });
+});
+
+describe("Slow-ping notification rendering", () => {
+    test("template status labels slow-ping notifications as slow ping instead of down", async () => {
+        const provider = new NotificationProvider();
+        const rendered = await provider.renderTemplate(
+            "{{ status }}",
+            "Slow response exceeded 1s",
+            {
+                name: "Demo Monitor",
+                type: "ping",
+                hostname: "example.com",
+            },
+            {
+                status: DOWN,
+                ping: 1500,
+                msg: "Slow response exceeded 1s",
+                isSlowPing: true,
+            }
+        );
+
+        assert.match(rendered, /Slow Ping/i);
+        assert.doesNotMatch(rendered, /Down/i);
     });
 });

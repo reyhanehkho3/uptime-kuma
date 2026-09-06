@@ -69,12 +69,16 @@ class Discord extends NotificationProvider {
             // If heartbeatJSON is not null, we go into the normal alerting loop.
             let addess = this.extractAddress(monitorJSON);
 
-            // Minimalist: status + name only (is down / is up; no "back up" — may be first trigger)
+            // Minimalist: status + name only (is down / is up / is slow ping; no "back up" — may be first trigger)
             if (messageFormat === "minimalist") {
-                const content =
-                    heartbeatJSON["status"] === DOWN
-                        ? "🔴 " + monitorJSON["name"] + " is down."
-                        : "🟢 " + monitorJSON["name"] + " is up.";
+                let content;
+                if (heartbeatJSON["isSlowPing"]) {
+                    content = "🟠 " + monitorJSON["name"] + " is slow pinging.";
+                } else if (heartbeatJSON["status"] === DOWN) {
+                    content = "🔴 " + monitorJSON["name"] + " is down.";
+                } else {
+                    content = "🟢 " + monitorJSON["name"] + " is up.";
+                }
                 let payload = {
                     username: discordDisplayName,
                     content: content,
@@ -126,8 +130,10 @@ class Discord extends NotificationProvider {
                     username: discordDisplayName,
                     embeds: [
                         {
-                            title: "❌ Your service " + monitorJSON["name"] + " went down. ❌",
-                            color: 16711680,
+                            title: heartbeatJSON["isSlowPing"]
+                                ? "⚠️ Your service " + monitorJSON["name"] + " is experiencing a slow ping. ⚠️"
+                                : "❌ Your service " + monitorJSON["name"] + " went down. ❌",
+                            color: heartbeatJSON["isSlowPing"] ? 16776960 : 16711680,
                             timestamp: heartbeatJSON["time"],
                             fields: [
                                 {
@@ -143,16 +149,19 @@ class Discord extends NotificationProvider {
                                       ]
                                     : []),
                                 {
-                                    name: "Went Offline",
-                                    // F for full date/time
-                                    value: `<t:${wentOfflineTimestamp}:F>`,
+                                    name: heartbeatJSON["isSlowPing"] ? "Current Ping" : "Went Offline",
+                                    value: heartbeatJSON["isSlowPing"]
+                                        ? heartbeatJSON["ping"] != null
+                                            ? heartbeatJSON["ping"] + " ms"
+                                            : "N/A"
+                                        : `<t:${wentOfflineTimestamp}:F>`,
                                 },
                                 {
                                     name: `Time (${heartbeatJSON["timezone"]})`,
                                     value: heartbeatJSON["localDateTime"],
                                 },
                                 {
-                                    name: "Error",
+                                    name: heartbeatJSON["isSlowPing"] ? "Slow Ping Details" : "Error",
                                     value: heartbeatJSON["msg"] == null ? "N/A" : heartbeatJSON["msg"],
                                 },
                             ],

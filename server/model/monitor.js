@@ -79,7 +79,7 @@ const rootCertificates = rootCertificatesFingerprints();
 // A second notification is sent when the response time drops back below the
 // threshold.
 const SLOW_PING_THRESHOLD_MS = 1000;
-const SLOW_PING_DURATION_MS = 30 * 1000;
+const SLOW_PING_DURATION_MS = 5 * 60 * 1000;
 
 // Per-monitor slow-ping tracking state. Lives outside the BeanModel instance
 // because BeanModel class-fields shadow redbean-node's Proxy accessor and
