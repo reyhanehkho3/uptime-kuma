@@ -72,6 +72,40 @@ const rootCertificates = rootCertificatesFingerprints();
  *      2 = PENDING
  *      3 = MAINTENANCE
  */
+
+// Slow-ping alert thresholds. When a monitor's response time stays above
+// SLOW_PING_THRESHOLD_MS continuously for SLOW_PING_DURATION_MS or longer,
+// a notification is sent through the monitor's configured notification list.
+// A second notification is sent when the response time drops back below the
+// threshold.
+const SLOW_PING_THRESHOLD_MS = 1000;
+const SLOW_PING_DURATION_MS = 30 * 1000;
+
+// Per-monitor slow-ping tracking state. Lives outside the BeanModel instance
+// because BeanModel class-fields shadow redbean-node's Proxy accessor and
+// cannot be read back after assignment (see PR discussion of this fix).
+// Persisted across server restarts via the monitor.slow_ping_start /
+// monitor.slow_ping_alert_sent columns — see Monitor.start() and
+// Monitor.checkSlowPingAlert for the load/save wiring.
+const slowPingState = new Map();
+
+/**
+ * Get (or lazily initialise) the in-memory slow-ping state for a monitor.
+ * @param {number} monitorID Monitor ID
+ * @returns {{slowPingStart: ?number, slowPingAlertSent: boolean}} Mutable state object
+ */
+function getSlowPingState(monitorID) {
+    let s = slowPingState.get(monitorID);
+    if (!s) {
+        s = {
+            slowPingStart: null,
+            slowPingAlertSent: false,
+        };
+        slowPingState.set(monitorID, s);
+    }
+    return s;
+}
+
 class Monitor extends BeanModel {
     /**
      * Return an object that ready to parse to JSON for public Only show
@@ -416,6 +450,19 @@ class Monitor extends BeanModel {
         let retries = 0;
 
         this.rootCertificates = rootCertificates;
+
+        // Restore persisted slow-ping alert state from the DB columns, if any.
+        // Without this, server restarts mid-slow-period would silently reset
+        // the timer and miss the recovery notification.
+        if (this.slowPingStart != null || this.slowPingAlertSent) {
+            const state = getSlowPingState(this.id);
+            state.slowPingStart = this.slowPingStart != null ? Number(this.slowPingStart) : null;
+            state.slowPingAlertSent = Boolean(this.slowPingAlertSent);
+            log.debug(
+                "monitor",
+                `[${this.name}] Restored slow-ping state: start=${state.slowPingStart} alertSent=${state.slowPingAlertSent}`
+            );
+        }
 
         try {
             this.prometheus = new Prometheus(this, await this.getTags());
@@ -1002,6 +1049,13 @@ class Monitor extends BeanModel {
                 }
             }
 
+            // Track sustained slow-ping periods and fire notifications via
+            // the monitor's configured notification list when the response
+            // time stays above SLOW_PING_THRESHOLD_MS for SLOW_PING_DURATION_MS.
+            // Independent of UP/DOWN so a slow service that eventually times
+            // out still alerts.
+            await Monitor.checkSlowPingAlert(this, bean);
+
             if (bean.status !== MAINTENANCE && Boolean(this.domainExpiryNotification)) {
                 try {
                     const supportInfo = await DomainExpiry.checkSupport(this);
@@ -1463,8 +1517,6 @@ class Monitor extends BeanModel {
             let msg = `[${monitor.name}] [${text}] ${bean.msg}`;
 
             const heartbeatJSON = await bean.toJSONAsync({ decodeResponse: true });
-            const monitorData = [{ id: monitor.id, active: monitor.active, name: monitor.name }];
-            const preloadData = await Monitor.preparePreloadData(monitorData);
             // Prevent if the msg is undefined, notifications such as Discord cannot send out.
             if (!heartbeatJSON["msg"]) {
                 heartbeatJSON["msg"] = "N/A";
@@ -1502,20 +1554,168 @@ class Monitor extends BeanModel {
                 }
             }
 
-            for (let notification of notificationList) {
-                try {
-                    await Notification.send(
-                        JSON.parse(notification.config),
-                        msg,
-                        monitor.toJSON(preloadData, false),
-                        heartbeatJSON
-                    );
-                } catch (e) {
-                    log.error("monitor", "Cannot send notification to " + notification.name);
-                    log.error("monitor", e);
-                }
+            await Monitor.dispatchNotifications(monitor, notificationList, msg, heartbeatJSON);
+        }
+    }
+
+    /**
+     * Iterate through a list of notifications and deliver each one.
+     * Shared between Monitor.sendNotification and Monitor.sendSlowPingNotification.
+     * @param {Monitor} monitor The monitor the notifications are about
+     * @param {Array} notificationList Result of Monitor.getNotificationList
+     * @param {string} msg Pre-formatted message
+     * @param {object} heartbeatJSON Heartbeat context for providers
+     * @returns {Promise<void>}
+     */
+    static async dispatchNotifications(monitor, notificationList, msg, heartbeatJSON) {
+        const monitorData = [{ id: monitor.id, active: monitor.active, name: monitor.name }];
+        const preloadData = await Monitor.preparePreloadData(monitorData);
+        const monitorJSON = monitor.toJSON(preloadData, false);
+        for (const notification of notificationList) {
+            try {
+                await Notification.send(JSON.parse(notification.config), msg, monitorJSON, heartbeatJSON);
+            } catch (e) {
+                log.error("monitor", "Cannot send notification to " + notification.name);
+                log.error("monitor", e);
             }
         }
+    }
+
+    /**
+     * Track sustained slow-ping periods on a monitor instance and fire
+     * notifications through Monitor.sendSlowPingNotification when the
+     * threshold is crossed and again when it recovers.
+     *
+     * State (slowPingStart / slowPingAlertSent) lives on the Monitor
+     * instance and is reset on every server restart — acceptable since
+     * a long slow period that started before restart will simply begin a
+     * new 5-min window after restart.
+     * @param {Monitor} monitor The monitor being checked
+     * @param {import("./heartbeat")} bean The current beat
+     * @returns {Promise<void>}
+     */
+    static async checkSlowPingAlert(monitor, bean) {
+        // Don't alert on paused monitors, during planned maintenance, or
+        // when ping wasn't measured.
+        if (!monitor.active) {
+            return;
+        }
+        if (bean.status === MAINTENANCE) {
+            return;
+        }
+        if (bean.ping == null || typeof bean.ping !== "number") {
+            return;
+        }
+
+        const state = getSlowPingState(monitor.id);
+        const overThreshold = bean.ping > SLOW_PING_THRESHOLD_MS;
+
+        if (overThreshold) {
+            if (state.slowPingStart === null) {
+                state.slowPingStart = Date.now();
+                Monitor._persistSlowPingState(monitor, state);
+            }
+            if (
+                !state.slowPingAlertSent &&
+                Date.now() - state.slowPingStart >= SLOW_PING_DURATION_MS
+            ) {
+                await Monitor.sendSlowPingNotification(monitor, bean, false);
+                state.slowPingAlertSent = true;
+                Monitor._persistSlowPingState(monitor, state);
+            }
+        } else {
+            // Ping dropped back below threshold. If we previously alerted,
+            // send a single recovery notification, then clear state.
+            if (state.slowPingAlertSent) {
+                await Monitor.sendSlowPingNotification(monitor, bean, true);
+            }
+            if (state.slowPingStart !== null || state.slowPingAlertSent) {
+                state.slowPingStart = null;
+                state.slowPingAlertSent = false;
+                Monitor._persistSlowPingState(monitor, state);
+            }
+        }
+    }
+
+    /**
+     * Persist the current slow-ping state to the monitor row. Called whenever
+     * state.slowPingStart or state.slowPingAlertSent changes, so the in-memory
+     * Map survives server restarts.
+     * @param {Monitor} monitor The monitor to persist
+     * @param {{slowPingStart: ?number, slowPingAlertSent: boolean}} state Current state
+     * @returns {Promise<void>}
+     */
+    static async _persistSlowPingState(monitor, state) {
+        try {
+            monitor.slowPingStart = state.slowPingStart;
+            monitor.slowPingAlertSent = state.slowPingAlertSent;
+            await R.store(monitor);
+        } catch (e) {
+            log.error("monitor", `[${monitor.name}] Could not persist slow-ping state: ${e.message}`);
+        }
+    }
+
+    /**
+     * Send a slow-ping (or slow-ping-recovery) notification to every
+     * notification provider configured for this monitor. Mirrors the shape
+     * of Monitor.sendNotification so the existing provider ecosystem can
+     * handle it.
+     *
+     * Trade-off note: heartbeatJSON.status is intentionally set to DOWN for
+     * the slow alert (UP for the recovery) so that providers branching on
+     * status === UP/DOWN (Discord, Slack, Telegram, etc. — 51 of them)
+     * still send something instead of nothing. The downside is that default Discord/Slack
+     * embeds render the "went down" template even though the service is
+     * still UP and just slow. The msg + isSlowPing/isSlowPingRecovery
+     * fields make the actual story unambiguous. A future improvement
+     * could introduce a SLOW_PING status (4) and update a few providers
+     * to special-case it; that's out of scope here.
+     * @param {Monitor} monitor The monitor the alert is about
+     * @param {import("./heartbeat")} bean The beat that triggered the alert
+     * @param {boolean} isRecovered True if this is a recovery notification
+     * @returns {Promise<void>}
+     */
+    static async sendSlowPingNotification(monitor, bean, isRecovered) {
+        const notificationList = await Monitor.getNotificationList(monitor);
+
+        if (notificationList.length === 0) {
+            log.debug(
+                "monitor",
+                `[${monitor.name}] Slow-ping notification skipped: no notifications configured for this monitor.`
+            );
+            return;
+        }
+
+        const header = isRecovered ? "✅ Slow Response Resolved" : "⚠️ Slow Response — not down, just slow";
+        const detail = isRecovered
+            ? `Response time is back below ${SLOW_PING_THRESHOLD_MS} ms (current: ${bean.ping} ms)`
+            : `Response time has exceeded ${SLOW_PING_THRESHOLD_MS} ms continuously for over 5 minutes (current: ${bean.ping} ms)`;
+
+        const msg = `[${monitor.name}] [${header}] ${detail}`;
+
+        // Build a heartbeatJSON-shaped object so providers receive the same
+        // shape they already understand. status is set to DOWN/UP so
+        // providers that branch on status still send something, and the
+        // msg field carries the actual story.
+        const heartbeatJSON = await bean.toJSONAsync({ decodeResponse: true });
+        heartbeatJSON.status = isRecovered ? UP : DOWN;
+        heartbeatJSON.msg = detail;
+        heartbeatJSON.isSlowPing = !isRecovered;
+        heartbeatJSON.isSlowPingRecovery = isRecovered;
+        if (!heartbeatJSON.msg) {
+            heartbeatJSON.msg = "N/A";
+        }
+
+        heartbeatJSON.timezone = await UptimeKumaServer.getInstance().getTimezone();
+        heartbeatJSON.timezoneOffset = UptimeKumaServer.getInstance().getTimezoneOffset();
+        heartbeatJSON.localDateTime = dayjs
+            .utc(heartbeatJSON.time)
+            .tz(heartbeatJSON.timezone)
+            .format(SQL_DATETIME_FORMAT);
+
+        log.debug("monitor", `[${monitor.name}] sendSlowPingNotification (recovered=${isRecovered})`);
+
+        await Monitor.dispatchNotifications(monitor, notificationList, msg, heartbeatJSON);
     }
 
     /**
