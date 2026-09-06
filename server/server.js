@@ -46,7 +46,7 @@ if (!semver.satisfies(nodeVersion, requiredNodeVersions)) {
 }
 
 const args = require("args-parser")(process.argv);
-const { sleep, log, getRandomInt, genSecret, isDev } = require("../src/util");
+const { sleep, log, getRandomInt, genSecret, isDev, UP, DOWN } = require("../src/util");
 const config = require("./config");
 
 process.title = "uptime-kuma";
@@ -1434,6 +1434,67 @@ let needSetup = false;
                 callback({
                     ok: true,
                     data: list,
+                });
+            } catch (e) {
+                callback({
+                    ok: false,
+                    msg: e.message,
+                });
+            }
+        });
+
+        socket.on("getLongestDowntime", async (monitorID, callback) => {
+            try {
+                checkLogin(socket);
+
+                // Load important heartbeats (state transitions) sorted by time.
+                // We can't use heartbeat.duration here because it's only populated for the push
+                // monitor type (see server/routers/api-router.js and server/model/monitor.js).
+                // The duration is derived from the time difference between a DOWN transition
+                // and the next UP transition.
+                const heartbeats = await R.find(
+                    "heartbeat",
+                    " monitor_id = ? AND important = 1 AND status IN (?, ?) ORDER BY time ASC ",
+                    [monitorID, UP, DOWN]
+                );
+
+                let longestDowntime = 0;
+                let lastDownBeat = null;
+                const now = dayjs.utc().valueOf();
+
+                for (const beat of heartbeats) {
+                    const beatStatus = Number(beat.status);
+                    if (beatStatus === DOWN) {
+                        // Start of an outage. If we somehow see a second consecutive DOWN
+                        // transition (shouldn't happen with important=1 heartbeats), keep the
+                        // earliest one so the outage spans the entire period.
+                        if (!lastDownBeat) {
+                            lastDownBeat = beat;
+                        }
+                    } else if (beatStatus === UP && lastDownBeat) {
+                        // End of an outage — measure the gap.
+                        const durationSec = Math.round((dayjs.utc(beat.time).valueOf() - dayjs.utc(lastDownBeat.time).valueOf()) / 1000);
+                        if (durationSec > longestDowntime) {
+                            longestDowntime = durationSec;
+                        }
+                        lastDownBeat = null;
+                    }
+                    // UP without a preceding DOWN (monitor just came online for the first
+                    // time) — skip, no outage to measure.
+                }
+
+                // If the monitor is currently DOWN, the outage is still in progress —
+                // include its elapsed time as a candidate for the longest.
+                if (lastDownBeat) {
+                    const ongoingSec = Math.round((now - dayjs.utc(lastDownBeat.time).valueOf()) / 1000);
+                    if (ongoingSec > longestDowntime) {
+                        longestDowntime = ongoingSec;
+                    }
+                }
+
+                callback({
+                    ok: true,
+                    duration: longestDowntime,
                 });
             } catch (e) {
                 callback({

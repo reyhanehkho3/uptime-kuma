@@ -59,6 +59,8 @@
     "Delete": "Delete",
     "Current": "Current",
     "Uptime": "Uptime",
+    "Longest Downtime": "Longest Downtime",
+    "Since creation": "Since creation",
     "Cert Exp.": "Cert Exp.",
     "Monitors": "{n} Monitor | {n} Monitors",
     "now": "now",
