@@ -128,6 +128,21 @@
                                 <input v-model="notification.applyExisting" class="form-check-input" type="checkbox" />
                                 <label class="form-check-label">{{ $t("Apply on all existing monitors") }}</label>
                             </div>
+
+                            <br />
+
+                            <div class="mb-3">
+                                <label for="escalation-level" class="form-label">{{ $t("Escalation Level") }}</label>
+                                <select id="escalation-level" v-model="notification.escalationLevel" class="form-select">
+                                    <option :value="null">{{ $t("Legacy / Immediate (default)") }}</option>
+                                    <option :value="1">{{ $t("Developer / Immediate (1)") }}</option>
+                                    <option :value="2">{{ $t("Tech Lead (2)") }}</option>
+                                    <option :value="3">{{ $t("Admin (3)") }}</option>
+                                </select>
+                                <div class="form-text">
+                                    {{ $t("escalationLevelDescription") || "Choose which escalation tier this notification provider belongs to. Legacy keeps the current immediate behavior." }}
+                                </div>
+                            </div>
                         </div>
                     </div>
 
@@ -435,6 +450,16 @@ export default {
                     if (n.id === notificationID) {
                         this.notification = JSON.parse(n.config);
 
+                        if (
+                            this.notification.escalationLevel !== undefined &&
+                            this.notification.escalationLevel !== null &&
+                            this.notification.escalationLevel !== ""
+                        ) {
+                            this.notification.escalationLevel = Number(this.notification.escalationLevel);
+                        } else {
+                            this.notification.escalationLevel = null;
+                        }
+
                         // applyExisting is one time only, but it got saved to database previously. Workaround fix, set it to false here to deal with the problem.
                         this.notification.applyExisting = false;
 
@@ -447,6 +472,7 @@ export default {
                     name: "",
                     type: "telegram",
                     isDefault: false,
+                    escalationLevel: null,
                 };
             }
 
@@ -459,6 +485,16 @@ export default {
          */
         submit() {
             this.processing = true;
+
+            // Normalize escalationLevel: ensure number or remove for legacy behavior.
+            // A null/empty value is the "Legacy / Immediate (default)" option and must
+            // be treated as legacy, not as the literal string "undefined".
+            if (this.notification.escalationLevel === undefined || this.notification.escalationLevel === null || this.notification.escalationLevel === "") {
+                delete this.notification.escalationLevel;
+            } else {
+                this.notification.escalationLevel = Number(this.notification.escalationLevel);
+            }
+
             this.$root.getSocket().emit("addNotification", this.notification, this.id, (res) => {
                 this.$root.toastRes(res);
                 this.processing = false;

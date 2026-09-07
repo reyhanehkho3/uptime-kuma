@@ -88,6 +88,25 @@ const SLOW_PING_DURATION_MS = 5 * 60 * 1000;
 // monitor.slow_ping_alert_sent columns — see Monitor.start() and
 // Monitor.checkSlowPingAlert for the load/save wiring.
 const slowPingState = new Map();
+const downState = new Map();
+
+/**
+ * Get (or lazily initialise) the in-memory down-escalation state for a monitor.
+ * @param {number} monitorID Monitor ID
+ * @returns {{downStart: ?number, downAlertLevel: number}} Mutable state object
+ */
+function getDownState(monitorID) {
+    let s = downState.get(monitorID);
+    if (!s) {
+        s = {
+            downStart: null,
+            downAlertLevel: 0, // 0 = none, 1 = developer/legacy notified, 2 = tech lead, 3 = admin
+        };
+        downState.set(monitorID, s);
+    }
+    return s;
+}
+
 
 /**
  * Get (or lazily initialise) the in-memory slow-ping state for a monitor.
@@ -1056,6 +1075,9 @@ class Monitor extends BeanModel {
             // out still alerts.
             await Monitor.checkSlowPingAlert(this, bean);
 
+            // Check DOWN escalation state machine (developer -> tech lead -> admin)
+            await Monitor.checkDownEscalation(this, bean);
+
             if (bean.status !== MAINTENANCE && Boolean(this.domainExpiryNotification)) {
                 try {
                     const supportInfo = await DomainExpiry.checkSupport(this);
@@ -1505,7 +1527,26 @@ class Monitor extends BeanModel {
      */
     static async sendNotification(isFirstBeat, monitor, bean) {
         if (!isFirstBeat || bean.status === DOWN) {
-            const notificationList = await Monitor.getNotificationList(monitor);
+            const fullNotificationList = await Monitor.getNotificationList(monitor);
+
+            // If this is a DOWN event, only send immediate notifications to
+            // legacy notifications (no escalationLevel in config) and those
+            // explicitly marked as escalationLevel 1 (developer). Notifications
+            // marked escalationLevel 2/3 will be sent later by the escalation
+            // state machine.
+            let notificationList = fullNotificationList;
+            if (bean.status === DOWN) {
+                notificationList = fullNotificationList.filter((n) => {
+                    try {
+                        const cfg = JSON.parse(n.config || "{}");
+                        // if escalationLevel is not set, treat as legacy -> include
+                        if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) return true;
+                        return Number(cfg.escalationLevel) === 1;
+                    } catch (e) {
+                        return true;
+                    }
+                });
+            }
 
             let text;
             if (bean.status === UP) {
@@ -1656,25 +1697,155 @@ class Monitor extends BeanModel {
     }
 
     /**
-     * Send a slow-ping (or slow-ping-recovery) notification to every
-     * notification provider configured for this monitor. Mirrors the shape
-     * of Monitor.sendNotification so the existing provider ecosystem can
-     * handle it.
-     *
-     * Trade-off note: heartbeatJSON.status is intentionally set to DOWN for
-     * the slow alert (UP for the recovery) so that providers branching on
-     * status === UP/DOWN (Discord, Slack, Telegram, etc. — 51 of them)
-     * still send something instead of nothing. The downside is that default Discord/Slack
-     * embeds render the "went down" template even though the service is
-     * still UP and just slow. The msg + isSlowPing/isSlowPingRecovery
-     * fields make the actual story unambiguous. A future improvement
-     * could introduce a SLOW_PING status (4) and update a few providers
-     * to special-case it; that's out of scope here.
-     * @param {Monitor} monitor The monitor the alert is about
-     * @param {import("./heartbeat")} bean The beat that triggered the alert
-     * @param {boolean} isRecovered True if this is a recovery notification
+     * Persist the current down-escalation state to the monitor row.
+     * @param {Monitor} monitor The monitor to persist
+     * @param {{downStart: ?number, downAlertLevel: number}} state Current state
      * @returns {Promise<void>}
      */
+    static async _persistDownState(monitor, state) {
+        try {
+            monitor.downStart = state.downStart;
+            monitor.downAlertLevel = state.downAlertLevel;
+            await R.store(monitor);
+        } catch (e) {
+            log.error("monitor", `[${monitor.name}] Could not persist down-escalation state: ${e.message}`);
+        }
+    }
+
+    /**
+     * Check and perform down-escalation notifications.
+     * This function implements tiered alerts for DOWN states:
+     *  - Immediate: developer / legacy notifications (escalationLevel unset or 1)
+     *  - After 2 minutes: tech lead notifications (escalationLevel = 2)
+     *  - After 5 minutes: admin notifications (escalationLevel = 3)
+     *
+     * Notifications that do not opt-in to escalation (legacy config without
+     * escalationLevel) will continue to receive the immediate alert for
+     * backward compatibility.
+     *
+     * This method is safe to call on every heartbeat; it is idempotent and
+     * persists its state to the monitor row so server restarts don't lose
+     * escalation context.
+     * @param {Monitor} monitor The monitor being checked
+     * @param {import("./heartbeat")} bean The current beat
+     * @returns {Promise<void>}
+     */
+    static async checkDownEscalation(monitor, bean) {
+        // Don't escalate for paused monitors or when under maintenance
+        if (!monitor.active) return;
+        if (bean.status === MAINTENANCE) return;
+
+        const state = getDownState(monitor.id);
+        const notificationList = await Monitor.getNotificationList(monitor);
+
+        // Helper: filter by escalation level where undefined = legacy (treat as immediate)
+        const filterByLevel = (list, level) => {
+            return list.filter((n) => {
+                try {
+                    const cfg = JSON.parse(n.config || "{}");
+                    if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) {
+                        // Legacy notifications remain equivalent to the immediate tier,
+                        // so they are included for the initial alert only and not for
+                        // later tech-lead/admin escalations.
+                        return level === 1;
+                    }
+                    return Number(cfg.escalationLevel) === level;
+                } catch (e) {
+                    return level === 1;
+                }
+            });
+        };
+
+        const TECH_MS = 2 * 60 * 1000;
+        const ADMIN_MS = 5 * 60 * 1000;
+
+        if (bean.status === DOWN) {
+            if (state.downStart === null) {
+                // First time we saw DOWN – start the window and persist.
+                state.downStart = Date.now();
+                // Determine if immediate notifications were (or will be) sent for level 1
+                const immediateRecipients = filterByLevel(notificationList, 1);
+                if (immediateRecipients.length > 0) {
+                    state.downAlertLevel = 1;
+                } else {
+                    state.downAlertLevel = 0;
+                }
+                await Monitor._persistDownState(monitor, state);
+                return;
+            }
+
+            const elapsed = Date.now() - state.downStart;
+
+            // Tech lead escalation at 2 minutes
+            if (elapsed >= TECH_MS && state.downAlertLevel < 2) {
+                const techList = filterByLevel(notificationList, 2);
+                if (techList.length > 0) {
+                    const heartbeatJSON = await bean.toJSONAsync({ decodeResponse: true });
+                    heartbeatJSON.status = DOWN;
+                    heartbeatJSON.msg = heartbeatJSON.msg || "N/A";
+                    heartbeatJSON.timezone = await UptimeKumaServer.getInstance().getTimezone();
+                    heartbeatJSON.timezoneOffset = UptimeKumaServer.getInstance().getTimezoneOffset();
+                    heartbeatJSON.localDateTime = dayjs.utc(heartbeatJSON.time).tz(heartbeatJSON.timezone).format(SQL_DATETIME_FORMAT);
+
+                    const msg = `[${monitor.name}] [⚠️ Prolonged outage] Service still down after ${Math.round(elapsed/1000)}s`;
+                    await Monitor.dispatchNotifications(monitor, techList, msg, heartbeatJSON);
+                }
+                state.downAlertLevel = 2;
+                await Monitor._persistDownState(monitor, state);
+            }
+
+            // Admin escalation at 5 minutes
+            if (elapsed >= ADMIN_MS && state.downAlertLevel < 3) {
+                const adminList = filterByLevel(notificationList, 3);
+                if (adminList.length > 0) {
+                    const heartbeatJSON = await bean.toJSONAsync({ decodeResponse: true });
+                    heartbeatJSON.status = DOWN;
+                    heartbeatJSON.msg = heartbeatJSON.msg || "N/A";
+                    heartbeatJSON.timezone = await UptimeKumaServer.getInstance().getTimezone();
+                    heartbeatJSON.timezoneOffset = UptimeKumaServer.getInstance().getTimezoneOffset();
+                    heartbeatJSON.localDateTime = dayjs.utc(heartbeatJSON.time).tz(heartbeatJSON.timezone).format(SQL_DATETIME_FORMAT);
+
+                    const msg = `[${monitor.name}] [🚨 Outage] Service still down after ${Math.round(elapsed/1000)}s`;
+                    await Monitor.dispatchNotifications(monitor, adminList, msg, heartbeatJSON);
+                }
+                state.downAlertLevel = 3;
+                await Monitor._persistDownState(monitor, state);
+            }
+        } else if (bean.status === UP) {
+            // Recovery: notify only those who were previously alerted (levels <= downAlertLevel)
+            if (state.downAlertLevel > 0) {
+                const heartbeatJSON = await bean.toJSONAsync({ decodeResponse: true });
+                heartbeatJSON.status = UP;
+                heartbeatJSON.msg = heartbeatJSON.msg || "N/A";
+                heartbeatJSON.timezone = await UptimeKumaServer.getInstance().getTimezone();
+                heartbeatJSON.timezoneOffset = UptimeKumaServer.getInstance().getTimezoneOffset();
+                heartbeatJSON.localDateTime = dayjs.utc(heartbeatJSON.time).tz(heartbeatJSON.timezone).format(SQL_DATETIME_FORMAT);
+
+                const recipients = notificationList.filter((n) => {
+                    try {
+                        const cfg = JSON.parse(n.config || "{}");
+                        if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) return true;
+                        return Number(cfg.escalationLevel) <= state.downAlertLevel;
+                    } catch (e) {
+                        return true;
+                    }
+                });
+
+                const msg = `[${monitor.name}] [✅ Recovered] Service recovered after ${state.downStart ? Math.round((Date.now() - state.downStart)/1000) : "N/A"}s`;
+                await Monitor.dispatchNotifications(monitor, recipients, msg, heartbeatJSON);
+            }
+
+            // Clear state
+            if (state.downStart !== null || state.downAlertLevel !== 0) {
+                state.downStart = null;
+                state.downAlertLevel = 0;
+                await Monitor._persistDownState(monitor, state);
+            }
+        }
+    }
+
+    /**
+     * Send a slow-ping (or slow-ping-recovery) notification to every
     static async sendSlowPingNotification(monitor, bean, isRecovered) {
         const notificationList = await Monitor.getNotificationList(monitor);
 
