@@ -118,6 +118,7 @@ const app = server.app;
 log.debug("server", "Importing Monitor");
 const Monitor = require("./model/monitor");
 const User = require("./model/user");
+const { computeLongestDowntime } = require("./util-downtime");
 
 log.debug("server", "Importing Settings");
 const {
@@ -1447,60 +1448,42 @@ let needSetup = false;
             try {
                 checkLogin(socket);
 
+                const monitor = await R.findOne("monitor", " id = ? ", [monitorID]);
+                if (!monitor) {
+                    throw new Error("Monitor not found");
+                }
+
                 // Load important heartbeats (state transitions) sorted by time.
                 // We can't use heartbeat.duration here because it's only populated for the push
                 // monitor type (see server/routers/api-router.js and server/model/monitor.js).
-                // The duration is derived from the time difference between a DOWN transition
-                // and the next UP transition.
+                // The downtime is measured between a DOWN transition and the next UP
+                // transition, minus any stretch with no stored heartbeats (Uptime Kuma
+                // offline / monitor paused), which is not attributable to the service —
+                // see server/util-downtime.js.
                 const heartbeats = await R.find(
                     "heartbeat",
                     " monitor_id = ? AND important = 1 AND status IN (?, ?) ORDER BY time ASC ",
                     [monitorID, UP, DOWN]
                 );
 
-                let longestDowntime = 0;
-                let lastDownBeat = null;
-                const now = dayjs.utc().valueOf();
+                const transitions = heartbeats.map((beat) => ({
+                    status: Number(beat.status),
+                    time: beat.time,
+                }));
 
-                for (const beat of heartbeats) {
-                    const beatStatus = Number(beat.status);
-                    if (beatStatus === DOWN) {
-                        // Start of an outage. If we somehow see a second consecutive DOWN
-                        // transition (shouldn't happen with important=1 heartbeats), keep the
-                        // earliest one so the outage spans the entire period.
-                        if (!lastDownBeat) {
-                            lastDownBeat = beat;
-                        }
-                    } else if (beatStatus === UP && lastDownBeat) {
-                        // End of an outage — measure the gap.
-                        const durationSec = Math.round((dayjs.utc(beat.time).valueOf() - dayjs.utc(lastDownBeat.time).valueOf()) / 1000);
-                        if (durationSec > longestDowntime) {
-                            longestDowntime = durationSec;
-                        }
-                        lastDownBeat = null;
-                    }
-                    // UP without a preceding DOWN (monitor just came online for the first
-                    // time) — skip, no outage to measure.
-                }
-
-                // If the monitor is currently DOWN, the outage is still in progress —
-                // include its elapsed time as a candidate for the longest. However,
-                // cap the ongoing window at the current server uptime so that a long
-                // period where Uptime Kuma itself was offline is not mis-attributed
-                // to the monitored service.
-                if (lastDownBeat) {
-                    const serverInstance = UptimeKumaServer.getInstance();
-                    const serverUptimeMs = serverInstance && serverInstance.startTime ? Math.max(0, Date.now() - serverInstance.startTime) : Number.MAX_SAFE_INTEGER;
-                    const ongoingMs = Math.min(now - dayjs.utc(lastDownBeat.time).valueOf(), serverUptimeMs);
-                    const ongoingSec = Math.round(ongoingMs / 1000);
-                    if (ongoingSec > longestDowntime) {
-                        longestDowntime = ongoingSec;
-                    }
-                }
+                const duration = await computeLongestDowntime(transitions, {
+                    intervalSec: monitor.interval,
+                    loadInnerBeats: async (downTime, endTime) => {
+                        return await R.getAll(
+                            "SELECT time FROM heartbeat WHERE monitor_id = ? AND time > ? AND time < ? ORDER BY time ASC ",
+                            [monitorID, downTime, endTime]
+                        );
+                    },
+                });
 
                 callback({
                     ok: true,
-                    duration: longestDowntime,
+                    duration,
                 });
             } catch (e) {
                 callback({

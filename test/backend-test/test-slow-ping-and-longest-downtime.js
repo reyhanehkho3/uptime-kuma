@@ -5,108 +5,241 @@ const NotificationProvider = require("../../server/notification-providers/notifi
 const { UP, DOWN, MAINTENANCE } = require("../../src/util");
 dayjs.extend(require("dayjs/plugin/utc"));
 
+// Tests exercise the REAL longest-downtime implementation
+// (server/util-downtime.js) — the same module the getLongestDowntime socket
+// handler uses — with an in-memory beat list instead of a hand-maintained
+// port, so the tests cannot drift from production logic.
+const { computeLongestDowntime } = require("../../server/util-downtime");
+
+const SQL_DATETIME_FORMAT = "YYYY-MM-DD HH:mm:ss.SSS";
+const fmt = (d) => d.format(SQL_DATETIME_FORMAT);
+
 /**
- * Pure-JS port of the longest-downtime algorithm from server/server.js
- * getLongestDowntime handler. Same logic, no DB.
- * @param {Array<{status: number, time: string}>} heartbeats Important heartbeats sorted ASC by time
- * @returns {number} Longest downtime duration in seconds (0 if no outages)
+ * Build a loadInnerBeats callback over an in-memory list of beat times
+ * (SQL datetime strings). Mimics the handler's
+ * `SELECT time ... WHERE time > ? AND time < ? ORDER BY time ASC` query.
+ * @param {string[]} allBeatTimes Every stored beat time for the monitor
+ * @returns {Function} loadInnerBeats(downTime, endTime)
  */
-function computeLongestDowntime(heartbeats) {
-    let longestDowntime = 0;
-    let lastDownBeat = null;
-    const now = dayjs.utc().valueOf();
-
-    for (const beat of heartbeats) {
-        const beatStatus = Number(beat.status);
-        if (beatStatus === DOWN) {
-            if (!lastDownBeat) {
-                lastDownBeat = beat;
-            }
-        } else if (beatStatus === UP && lastDownBeat) {
-            const durationSec = Math.round(
-                (dayjs.utc(beat.time).valueOf() - dayjs.utc(lastDownBeat.time).valueOf()) / 1000
-            );
-            if (durationSec > longestDowntime) {
-                longestDowntime = durationSec;
-            }
-            lastDownBeat = null;
-        }
-    }
-
-    if (lastDownBeat) {
-        const ongoingSec = Math.round(
-            (now - dayjs.utc(lastDownBeat.time).valueOf()) / 1000
-        );
-        if (ongoingSec > longestDowntime) {
-            longestDowntime = ongoingSec;
-        }
-    }
-
-    return longestDowntime;
+function makeInnerBeatLoader(allBeatTimes) {
+    return async (downTime, endTime) =>
+        allBeatTimes
+            .filter((t) => t > downTime && t < endTime)
+            .sort()
+            .map((time) => ({ time }));
 }
 
 describe("Longest downtime algorithm", () => {
-    test("empty heartbeats → 0", () => {
-        assert.strictEqual(computeLongestDowntime([]), 0);
+    test("empty heartbeats → 0", async () => {
+        const duration = await computeLongestDowntime([], {
+            intervalSec: 60,
+            loadInnerBeats: makeInnerBeatLoader([]),
+            nowMs: dayjs.utc("2026-01-01 12:00:00.000").valueOf(),
+        });
+        assert.strictEqual(duration, 0);
     });
 
-    test("single DOWN beat (currently down) → ongoing duration in seconds", () => {
-        const twoMinAgo = dayjs.utc().subtract(2, "minute").format("YYYY-MM-DD HH:mm:ss.SSS");
-        assert.strictEqual(computeLongestDowntime([
-            { status: DOWN, time: twoMinAgo },
-        ]), 120);
-    });
-
-    test("DOWN→UP pair → returns the gap", () => {
-        const start = dayjs.utc("2026-01-01 10:00:00.000");
-        const end = start.add(2, "minute");
-        assert.strictEqual(computeLongestDowntime([
-            { status: DOWN, time: start.format("YYYY-MM-DD HH:mm:ss.SSS") },
-            { status: UP, time: end.format("YYYY-MM-DD HH:mm:ss.SSS") },
-        ]), 120);
-    });
-
-    test("DOWN→UP→DOWN (recover then down again) → max of completed + ongoing", () => {
+    test("ongoing outage with beats at normal cadence → full window counted", async () => {
         const t0 = dayjs.utc("2026-01-01 10:00:00.000");
-        const t1 = t0.add(1, "minute");   // short outage ended here
-        const t2 = dayjs.utc().subtract(3, "minute");  // longer ongoing outage
-
-        const longest = computeLongestDowntime([
-            { status: DOWN, time: t0.format("YYYY-MM-DD HH:mm:ss.SSS") },
-            { status: UP, time: t1.format("YYYY-MM-DD HH:mm:ss.SSS") },
-            { status: DOWN, time: t2.format("YYYY-MM-DD HH:mm:ss.SSS") },
-        ]);
-
-        // 60s completed, ~180s ongoing → 180
-        assert.ok(longest >= 175 && longest <= 185, `expected ~180, got ${longest}`);
+        const now = t0.add(2, "minute");
+        const duration = await computeLongestDowntime(
+            [{ status: DOWN, time: fmt(t0) }],
+            {
+                intervalSec: 60,
+                loadInnerBeats: makeInnerBeatLoader([fmt(t0.add(60, "second"))]),
+                nowMs: now.valueOf(),
+            }
+        );
+        assert.strictEqual(duration, 120);
     });
 
-    test("only DOWN beats (never recovered) → ongoing duration", () => {
-        const tenMinAgo = dayjs.utc().subtract(10, "minute").format("YYYY-MM-DD HH:mm:ss.SSS");
-        assert.strictEqual(computeLongestDowntime([
-            { status: DOWN, time: tenMinAgo },
-        ]), 600);
-    });
-
-    test("multiple completed outages → longest wins", () => {
+    test("DOWN→UP pair within one interval, no inner beats → gap counted", async () => {
         const t0 = dayjs.utc("2026-01-01 10:00:00.000");
-        assert.strictEqual(computeLongestDowntime([
-            { status: DOWN, time: t0.format("YYYY-MM-DD HH:mm:ss.SSS") },
-            { status: UP, time: t0.add(1, "minute").format("YYYY-MM-DD HH:mm:ss.SSS") },
-            { status: DOWN, time: t0.add(10, "minute").format("YYYY-MM-DD HH:mm:ss.SSS") },
-            { status: UP, time: t0.add(20, "minute").format("YYYY-MM-DD HH:mm:ss.SSS") },  // 10-min
-            { status: DOWN, time: t0.add(30, "minute").format("YYYY-MM-DD HH:mm:ss.SSS") },
-            { status: UP, time: t0.add(33, "minute").format("YYYY-MM-DD HH:mm:ss.SSS") },  // 3-min
-        ]), 600);
+        const duration = await computeLongestDowntime(
+            [
+                { status: DOWN, time: fmt(t0) },
+                { status: UP, time: fmt(t0.add(2, "minute")) },
+            ],
+            {
+                intervalSec: 60,
+                loadInnerBeats: makeInnerBeatLoader([]),
+                nowMs: t0.add(3, "minute").valueOf(),
+            }
+        );
+        assert.strictEqual(duration, 120);
     });
 
-    test("UP beat without preceding DOWN is skipped", () => {
+    test("DOWN→UP→DOWN (recover then down again) → max of completed + ongoing", async () => {
         const t0 = dayjs.utc("2026-01-01 10:00:00.000");
-        assert.strictEqual(computeLongestDowntime([
-            { status: UP, time: t0.format("YYYY-MM-DD HH:mm:ss.SSS") },  // initial UP, ignored
-            { status: DOWN, time: t0.add(1, "minute").format("YYYY-MM-DD HH:mm:ss.SSS") },
-            { status: UP, time: t0.add(2, "minute").format("YYYY-MM-DD HH:mm:ss.SSS") },
-        ]), 60);
+        const t2 = t0.add(10, "minute"); // ongoing outage starts here
+
+        const duration = await computeLongestDowntime(
+            [
+                { status: DOWN, time: fmt(t0) },
+                { status: UP, time: fmt(t0.add(1, "minute")) },
+                { status: DOWN, time: fmt(t2) },
+            ],
+            {
+                intervalSec: 60,
+                loadInnerBeats: makeInnerBeatLoader([
+                    fmt(t2.add(60, "second")),
+                    fmt(t2.add(120, "second")),
+                ]),
+                nowMs: t2.add(3, "minute").valueOf(),
+            }
+        );
+
+        // 60s completed, 180s ongoing → 180
+        assert.strictEqual(duration, 180);
+    });
+
+    test("long ongoing outage with continuous beats → fully counted", async () => {
+        const t0 = dayjs.utc("2026-01-01 10:00:00.000");
+        const inner = [];
+        for (let i = 1; i <= 9; i++) {
+            inner.push(fmt(t0.add(i, "minute")));
+        }
+        const duration = await computeLongestDowntime(
+            [{ status: DOWN, time: fmt(t0) }],
+            {
+                intervalSec: 60,
+                loadInnerBeats: makeInnerBeatLoader(inner),
+                nowMs: t0.add(10, "minute").valueOf(),
+            }
+        );
+        assert.strictEqual(duration, 600);
+    });
+
+    test("multiple completed outages → longest wins", async () => {
+        const t0 = dayjs.utc("2026-01-01 10:00:00.000");
+        const innerForTenMinWindow = [];
+        for (let i = 1; i <= 9; i++) {
+            innerForTenMinWindow.push(fmt(t0.add(10, "minute").add(i, "minute")));
+        }
+        const duration = await computeLongestDowntime(
+            [
+                { status: DOWN, time: fmt(t0) },
+                { status: UP, time: fmt(t0.add(1, "minute")) },
+                { status: DOWN, time: fmt(t0.add(10, "minute")) },
+                { status: UP, time: fmt(t0.add(20, "minute")) },  // 10-min
+                { status: DOWN, time: fmt(t0.add(30, "minute")) },
+                { status: UP, time: fmt(t0.add(33, "minute")) },  // 3-min
+            ],
+            {
+                intervalSec: 60,
+                loadInnerBeats: makeInnerBeatLoader([
+                    ...innerForTenMinWindow,
+                    fmt(t0.add(31, "minute")),
+                    fmt(t0.add(32, "minute")),
+                ]),
+                nowMs: t0.add(40, "minute").valueOf(),
+            }
+        );
+        assert.strictEqual(duration, 600);
+    });
+
+    test("UP beat without preceding DOWN is skipped", async () => {
+        const t0 = dayjs.utc("2026-01-01 10:00:00.000");
+        const duration = await computeLongestDowntime(
+            [
+                { status: UP, time: fmt(t0) },  // initial UP, ignored
+                { status: DOWN, time: fmt(t0.add(1, "minute")) },
+                { status: UP, time: fmt(t0.add(2, "minute")) },
+            ],
+            {
+                intervalSec: 60,
+                loadInnerBeats: makeInnerBeatLoader([]),
+                nowMs: t0.add(3, "minute").valueOf(),
+            }
+        );
+        assert.strictEqual(duration, 60);
+    });
+
+    test("no data at all inside a long window (Uptime Kuma offline) → 0", async () => {
+        // Monitor added while the service was down; Uptime Kuma was off for
+        // the whole window and the first post-restart beat was UP.
+        const t0 = dayjs.utc("2026-01-01 10:00:00.000");
+        const duration = await computeLongestDowntime(
+            [
+                { status: DOWN, time: fmt(t0) },
+                { status: UP, time: fmt(t0.add(10, "minute")) },
+            ],
+            {
+                intervalSec: 60,
+                loadInnerBeats: makeInnerBeatLoader([]),
+                nowMs: t0.add(11, "minute").valueOf(),
+            }
+        );
+        assert.strictEqual(duration, 0);
+    });
+
+    test("regression: Uptime Kuma offline for hours mid-outage → only observed downtime counted", async () => {
+        // DOWN, beats for 2 minutes, Uptime Kuma goes offline for ~3 hours,
+        // comes back and the first beat is UP (service recovered while Kuma
+        // was off — or at least, there is no data to say it stayed down).
+        const t0 = dayjs.utc("2026-01-01 10:00:00.000");
+        const duration = await computeLongestDowntime(
+            [
+                { status: DOWN, time: fmt(t0) },
+                { status: UP, time: fmt(t0.add(3, "hour")) },
+            ],
+            {
+                intervalSec: 60,
+                loadInnerBeats: makeInnerBeatLoader([
+                    fmt(t0.add(60, "second")),
+                    fmt(t0.add(120, "second")),
+                ]),
+                nowMs: t0.add(3, "hour").add(1, "minute").valueOf(),
+            }
+        );
+        // Previously this returned the full 3-hour window (10800s).
+        assert.strictEqual(duration, 120);
+    });
+
+    test("regression: Uptime Kuma restarted mid-outage and service still down → gap excluded, observed parts summed", async () => {
+        // DOWN at t0, beats for 5 minutes, Kuma off for ~55 minutes, restart
+        // (first beat after restart is an important DOWN transition), beats
+        // resume for another 4 minutes, still down at `now`.
+        const t0 = dayjs.utc("2026-01-01 10:00:00.000");
+        const inner = [];
+        for (let i = 1; i <= 5; i++) {
+            inner.push(fmt(t0.add(i, "minute")));
+        }
+        for (let i = 1; i <= 4; i++) {
+            inner.push(fmt(t0.add(60, "minute").add(i, "minute")));
+        }
+        const duration = await computeLongestDowntime(
+            [
+                { status: DOWN, time: fmt(t0) },
+                { status: DOWN, time: fmt(t0.add(60, "minute")) },  // first beat after restart
+            ],
+            {
+                intervalSec: 60,
+                loadInnerBeats: makeInnerBeatLoader(inner),
+                nowMs: t0.add(65, "minute").valueOf(),
+            }
+        );
+        // Observed: 300s before the gap + 180s of beats after restart + 60s
+        // tail = 540s. The ~55-minute no-data stretch is excluded.
+        assert.strictEqual(duration, 540);
+    });
+
+    test("ongoing outage with a stale tail (Kuma currently offline) → tail excluded", async () => {
+        const t0 = dayjs.utc("2026-01-01 10:00:00.000");
+        const duration = await computeLongestDowntime(
+            [{ status: DOWN, time: fmt(t0) }],
+            {
+                intervalSec: 60,
+                loadInnerBeats: makeInnerBeatLoader([
+                    fmt(t0.add(60, "second")),
+                    fmt(t0.add(120, "second")),
+                ]),
+                nowMs: t0.add(1, "hour").valueOf(),
+            }
+        );
+        // Beats stopped 58 minutes ago — no data since, so only the first
+        // 120 seconds count.
+        assert.strictEqual(duration, 120);
     });
 });
 
