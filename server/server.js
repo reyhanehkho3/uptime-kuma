@@ -46,7 +46,7 @@ if (!semver.satisfies(nodeVersion, requiredNodeVersions)) {
 }
 
 const args = require("args-parser")(process.argv);
-const { sleep, log, getRandomInt, genSecret, isDev } = require("../src/util");
+const { sleep, log, getRandomInt, genSecret, isDev, UP, DOWN } = require("../src/util");
 const config = require("./config");
 
 process.title = "uptime-kuma";
@@ -118,6 +118,7 @@ const app = server.app;
 log.debug("server", "Importing Monitor");
 const Monitor = require("./model/monitor");
 const User = require("./model/user");
+const { computeLongestDowntime } = require("./util-downtime");
 
 log.debug("server", "Importing Settings");
 const {
@@ -1434,6 +1435,55 @@ let needSetup = false;
                 callback({
                     ok: true,
                     data: list,
+                });
+            } catch (e) {
+                callback({
+                    ok: false,
+                    msg: e.message,
+                });
+            }
+        });
+
+        socket.on("getLongestDowntime", async (monitorID, callback) => {
+            try {
+                checkLogin(socket);
+
+                const monitor = await R.findOne("monitor", " id = ? ", [monitorID]);
+                if (!monitor) {
+                    throw new Error("Monitor not found");
+                }
+
+                // Load important heartbeats (state transitions) sorted by time.
+                // We can't use heartbeat.duration here because it's only populated for the push
+                // monitor type (see server/routers/api-router.js and server/model/monitor.js).
+                // The downtime is measured between a DOWN transition and the next UP
+                // transition, minus any stretch with no stored heartbeats (Uptime Kuma
+                // offline / monitor paused), which is not attributable to the service —
+                // see server/util-downtime.js.
+                const heartbeats = await R.find(
+                    "heartbeat",
+                    " monitor_id = ? AND important = 1 AND status IN (?, ?) ORDER BY time ASC ",
+                    [monitorID, UP, DOWN]
+                );
+
+                const transitions = heartbeats.map((beat) => ({
+                    status: Number(beat.status),
+                    time: beat.time,
+                }));
+
+                const duration = await computeLongestDowntime(transitions, {
+                    intervalSec: monitor.interval,
+                    loadInnerBeats: async (downTime, endTime) => {
+                        return await R.getAll(
+                            "SELECT time FROM heartbeat WHERE monitor_id = ? AND time > ? AND time < ? ORDER BY time ASC ",
+                            [monitorID, downTime, endTime]
+                        );
+                    },
+                });
+
+                callback({
+                    ok: true,
+                    duration,
                 });
             } catch (e) {
                 callback({

@@ -1,7 +1,8 @@
 /*
  * For Client Socket
  */
-const { TimeLogger } = require("../src/util");
+const { TimeLogger, DOWN } = require("../src/util");
+const IncidentTracker = require("./incident-tracker");
 const { R } = require("redbean-node");
 const { UptimeKumaServer } = require("./uptime-kuma-server");
 const server = UptimeKumaServer.getInstance();
@@ -56,6 +57,16 @@ async function sendHeartbeatList(socket, monitorID, toUser = false, overwrite = 
 
     let result = list.reverse();
 
+    // If this monitor is folded into an incident as an affected child, suppress its DOWN events in the UI
+    // — the root-cause monitor's consolidated incident message is shown instead.
+    try {
+        if (monitorID && IncidentTracker.isAffected(monitorID)) {
+            result = result.filter((hb) => Number(hb.status) !== DOWN);
+        }
+    } catch (e) {
+        // On any error, fall back to unfiltered results
+    }
+
     if (toUser) {
         io.to(socket.userID).emit("heartbeatList", monitorID, result, overwrite);
     } else {
@@ -87,7 +98,16 @@ async function sendImportantHeartbeatList(socket, monitorID, toUser = false, ove
 
     timeLogger.print(`[Monitor: ${monitorID}] sendImportantHeartbeatList`);
 
-    const result = list.map((bean) => bean.toJSON());
+    let result = list.map((bean) => bean.toJSON());
+
+    // Suppress DOWN events for affected children; incident root carries the consolidated message
+    try {
+        if (monitorID && IncidentTracker.isAffected(monitorID)) {
+            result = result.filter((hb) => Number(hb.status) !== DOWN);
+        }
+    } catch (e) {
+        // ignore errors and send unfiltered list
+    }
 
     if (toUser) {
         io.to(socket.userID).emit("importantHeartbeatList", monitorID, result, overwrite);

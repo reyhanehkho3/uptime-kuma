@@ -13,8 +13,11 @@ class Teams extends NotificationProvider {
      * @param {boolean} withStatusSymbol If the status should be prepended as symbol
      * @returns {string} Status message
      */
-    _statusMessageFactory = (status, monitorName, withStatusSymbol) => {
+    _statusMessageFactory = (status, monitorName, withStatusSymbol, heartbeatJSON = null) => {
         if (status === DOWN) {
+            if (heartbeatJSON?.isSlowPing) {
+                return (withStatusSymbol ? "🟠 " : "") + `[${monitorName}] is experiencing a slow ping`;
+            }
             return (withStatusSymbol ? "🔴 " : "") + `[${monitorName}] went down`;
         } else if (status === UP) {
             return (withStatusSymbol ? "✅ " : "") + `[${monitorName}] is back online`;
@@ -27,8 +30,11 @@ class Teams extends NotificationProvider {
      * @param {const} status The status constant
      * @returns {string} Selected style for adaptive cards
      */
-    _getStyle = (status) => {
+    _getStyle = (status, heartbeatJSON = null) => {
         if (status === DOWN) {
+            if (heartbeatJSON?.isSlowPing) {
+                return "warning";
+            }
             return "attention";
         }
         if (status === UP) {
@@ -115,7 +121,7 @@ class Teams extends NotificationProvider {
                 items: [
                     {
                         type: "ColumnSet",
-                        style: this._getStyle(status),
+                        style: this._getStyle(status, heartbeatJSON),
                         columns: [
                             {
                                 type: "Column",
@@ -139,7 +145,7 @@ class Teams extends NotificationProvider {
                                         type: "TextBlock",
                                         size: "Medium",
                                         weight: "Bolder",
-                                        text: `**${this._statusMessageFactory(status, monitorName, false)}**`,
+                                        text: `**${this._statusMessageFactory(status, monitorName, false, heartbeatJSON)}**`,
                                     },
                                     {
                                         type: "TextBlock",
@@ -187,7 +193,7 @@ class Teams extends NotificationProvider {
         const payload = {
             type: "message",
             // message with status prefix as notification text
-            summary: this._statusMessageFactory(status, monitorName, true),
+            summary: this._statusMessageFactory(status, monitorName, true, heartbeatJSON),
             attachments: [
                 {
                     contentType: "application/vnd.microsoft.card.adaptive",

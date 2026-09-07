@@ -72,6 +72,22 @@ class NotificationProvider {
      * @param {?object} heartbeatJSON Heartbeat details (For Up/Down only)
      * @returns {Promise<string>} rendered template
      */
+    getStatusLabel(heartbeatJSON) {
+        if (!heartbeatJSON) {
+            return "⚠️ Test";
+        }
+
+        if (heartbeatJSON.isSlowPing === true) {
+            return "🟠 Slow Ping";
+        }
+
+        if (heartbeatJSON.isSlowPingRecovery === true) {
+            return "✅ Slow Ping Resolved";
+        }
+
+        return heartbeatJSON.status === DOWN ? "🔴 Down" : "✅ Up";
+    }
+
     async renderTemplate(template, msg, monitorJSON, heartbeatJSON) {
         const engine = new Liquid({
             root: "./no-such-directory-uptime-kuma",
@@ -89,10 +105,7 @@ class NotificationProvider {
             monitorHostnameOrURL = this.extractAddress(monitorJSON);
         }
 
-        let serviceStatus = "⚠️ Test";
-        if (heartbeatJSON !== null) {
-            serviceStatus = heartbeatJSON["status"] === DOWN ? "🔴 Down" : "✅ Up";
-        }
+        const serviceStatus = this.getStatusLabel(heartbeatJSON);
 
         const context = {
             // for v1 compatibility, to be removed in v3

@@ -17,7 +17,7 @@ class Flowtriq extends NotificationProvider {
 
             if (heartbeatJSON != null) {
                 if (heartbeatJSON.status === DOWN) {
-                    status = "down";
+                    status = heartbeatJSON.isSlowPing ? "slow_ping" : "down";
                 } else if (heartbeatJSON.status === UP) {
                     status = "up";
                 }

@@ -24,7 +24,10 @@ class AlertNow extends NotificationProvider {
                 eventType = "INFO";
                 eventId += `_${heartbeatJSON.name.replace(/\s/g, "")}`;
             } else if (heartbeatJSON && heartbeatJSON.status === DOWN) {
-                textMsg = `[${heartbeatJSON.name}] 🔴 Application went down`;
+                textMsg = `[${heartbeatJSON.name}] ${heartbeatJSON.isSlowPing ? "🟠 Application is experiencing a slow ping" : "🔴 Application went down"}`;
+                if (heartbeatJSON.isSlowPing) {
+                    eventType = "WARN";
+                }
             }
 
             textMsg += ` - ${msg}`;

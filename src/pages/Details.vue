@@ -257,6 +257,15 @@
                         </span>
                     </div>
 
+                    <!-- Longest Downtime -->
+                    <div class="col-12 col-sm col row d-flex align-items-center d-sm-block">
+                        <h4 class="col-4 col-sm-12">{{ $t("Longest Downtime") }}</h4>
+                        <p class="col-4 col-sm-12 mb-0 mb-sm-2">({{ $t("Since creation") }})</p>
+                        <span class="col-4 col-sm-12 num">
+                            {{ longestDowntimeText }}
+                        </span>
+                    </div>
+
                     <div v-if="tlsInfo" class="col-12 col-sm col row d-flex align-items-center d-sm-block">
                         <h4 class="col-4 col-sm-12">{{ $t("Cert Exp.") }}</h4>
                         <p class="col-4 col-sm-12 mb-0 mb-sm-2">
@@ -492,6 +501,8 @@ export default {
             cacheTime: Date.now(),
             importantHeartBeatListLength: 0,
             displayedRecords: [],
+            longestDowntime: 0,
+            longestDowntimeLoaded: false,
             pushMonitor: {
                 showPushExamples: false,
                 currentExample: "javascript-fetch",
@@ -602,6 +613,20 @@ export default {
                 return "";
             }
         },
+
+        /**
+         * Render the longest downtime as a human-readable string.
+         * @returns {string} Formatted duration, or "—" if no data yet / no outage has occurred.
+         */
+        longestDowntimeText() {
+            if (!this.longestDowntimeLoaded) {
+                return this.$t("notAvailableShort");
+            }
+            if (this.longestDowntime > 0) {
+                return timeDurationFormatter.secondsToHumanReadableFormat(this.longestDowntime);
+            }
+            return this.$t("notAvailableShort");
+        },
     },
 
     watch: {
@@ -611,6 +636,7 @@ export default {
 
         monitor(to) {
             this.getImportantHeartbeatListLength();
+            this.loadLongestDowntime();
         },
         "monitor.type"() {
             if (this.monitor && this.monitor.type === "push") {
@@ -624,6 +650,7 @@ export default {
 
     mounted() {
         this.getImportantHeartbeatListLength();
+        this.loadLongestDowntime();
 
         this.$root.emitter.on("newImportantHeartbeat", this.onNewImportantHeartbeat);
 
@@ -840,6 +867,24 @@ export default {
                     }
                     this.importantHeartBeatListLength += 1;
                 }
+                // A state transition may have ended (or started) the longest outage —
+                // re-fetch so the stat stays current without a page reload.
+                this.loadLongestDowntime();
+            }
+        },
+
+        /**
+         * Fetch the longest downtime (in seconds) for this monitor from the server.
+         * @returns {void}
+         */
+        loadLongestDowntime() {
+            if (this.monitor) {
+                this.$root.getSocket().emit("getLongestDowntime", this.monitor.id, (res) => {
+                    if (res && res.ok) {
+                        this.longestDowntime = res.duration;
+                        this.longestDowntimeLoaded = true;
+                    }
+                });
             }
         },
 

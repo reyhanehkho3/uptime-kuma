@@ -26,7 +26,9 @@ class GoogleSheets extends NotificationProvider {
             }
 
             if (heartbeatJSON) {
-                status = heartbeatJSON.status === DOWN ? "DOWN" : heartbeatJSON.status === UP ? "UP" : "UNKNOWN";
+                status = heartbeatJSON.status === DOWN
+                    ? heartbeatJSON.isSlowPing ? "SLOW_PING" : "DOWN"
+                    : heartbeatJSON.status === UP ? "UP" : "UNKNOWN";
                 responseTime = heartbeatJSON.ping || "N/A";
                 statusCode = heartbeatJSON.statusCode || "N/A";
             }

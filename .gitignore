@@ -25,3 +25,7 @@ extra/exe-builder/obj
 .vs
 .vscode
 .devcontainer
+
+
+CLAUDE.md
+AGENTS.md

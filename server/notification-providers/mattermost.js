@@ -54,11 +54,11 @@ class Mattermost extends NotificationProvider {
                 iconEmoji = mattermostIconEmojiOffline || mattermostIconEmoji;
                 statusField = {
                     short: false,
-                    title: "Error",
-                    value: heartbeatJSON.msg,
+                    title: heartbeatJSON.isSlowPing ? "Ping" : "Error",
+                    value: heartbeatJSON.isSlowPing ? heartbeatJSON.ping + "ms" : heartbeatJSON.msg,
                 };
-                statusText = "down.";
-                color = "#FF0000";
+                statusText = heartbeatJSON.isSlowPing ? "slow ping." : "down.";
+                color = heartbeatJSON.isSlowPing ? "#FFA500" : "#FF0000";
             } else if (heartbeatJSON.status === UP) {
                 iconEmoji = mattermostIconEmojiOnline || mattermostIconEmoji;
                 statusField = {

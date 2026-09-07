@@ -1758,6 +1758,26 @@
                                     {{ domainExpiryUnsupportedReason }}
                                 </div>
                             </div>
+
+                            <!-- Root-cause incident grouping (opt-in per monitor) -->
+                            <div class="my-3 form-check">
+                                <input
+                                    id="group-notifications"
+                                    v-model="monitor.groupNotifications"
+                                    class="form-check-input"
+                                    type="checkbox"
+                                    :disabled="!monitor.parent"
+                                />
+                                <label class="form-check-label" for="group-notifications">
+                                    {{ $t("groupNotifications") }}
+                                </label>
+                                <div class="form-text">
+                                    {{ $t("groupNotificationsHelp") }}
+                                    <span v-if="!monitor.parent" class="d-block text-muted mt-1">
+                                        {{ $t("groupNotificationsRequireParent") }}
+                                    </span>
+                                </div>
+                            </div>
                             <div v-if="monitor.type === 'websocket-upgrade'" class="my-3 form-check">
                                 <input
                                     id="wsIgnoreSecWebsocketAcceptHeader"
@@ -2165,9 +2185,9 @@
                                 </div>
                             </div>
 
-                            <!-- Parent Monitor -->
+                            <!-- Parent Monitor (used for organisational grouping AND for declaring a dependency to enable root-cause incident grouping) -->
                             <div class="my-3">
-                                <label for="monitorGroupSelector" class="form-label">{{ $t("Monitor Group") }}</label>
+                                <label for="monitorGroupSelector" class="form-label">{{ $t("Parent Monitor") }}</label>
                                 <ActionSelect
                                     id="monitorGroupSelector"
                                     v-model="monitor.parent"
@@ -2177,6 +2197,9 @@
                                     :icon="'plus'"
                                     :action="() => $refs.createGroupDialog.show()"
                                 />
+                                <div class="form-text">
+                                    {{ $t("parentMonitorDescription") }}
+                                </div>
                             </div>
 
                             <!-- Description -->
@@ -3291,6 +3314,7 @@ const monitorDefaults = {
     upsideDown: false,
     expiryNotification: false,
     domainExpiryNotification: true,
+    groupNotifications: false,
     maxredirects: 10,
     accepted_statuscodes: defaultValueList.http.accepted_statuscodes,
     saveResponse: false,
@@ -3560,15 +3584,19 @@ message HealthCheckResponse {
             return null;
         },
 
-        // Filter result by active state, weight and alphabetical
-        // Only return groups which arent't itself and one of its descendants
+        // Filter result by active state, weight and alphabetical.
+        // Returns all monitors except itself and any descendant (a monitor
+        // cannot be its own ancestor). Group monitors remain allowed so the
+        // existing organisational-grouping flow keeps working, but service
+        // monitors are also included now so a monitor can declare a
+        // dependency relationship (used by the root-cause incident grouping
+        // feature) instead of being limited to group containers.
         sortedGroupMonitorList() {
             let result = Object.values(this.$root.monitorList);
 
-            // Only groups, not itself, not a descendant
+            // Not itself, not a descendant
             result = result.filter(
                 (monitor) =>
-                    monitor.type === "group" &&
                     monitor.id !== this.monitor.id &&
                     !this.monitor.childrenIDs?.includes(monitor.id)
             );
