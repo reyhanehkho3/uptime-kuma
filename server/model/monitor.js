@@ -1046,17 +1046,34 @@ class Monitor extends BeanModel {
             log.debug("monitor", `[${this.name}] Check isImportant`);
             let isImportant = Monitor.isImportantBeat(isFirstBeat, previousBeat?.status, bean.status);
 
+            // The importance flag is part of the stored heartbeat row, so set
+            // it before persisting.
+            bean.important = isImportant;
+
+            // Calculate uptime before storing so end_time is persisted with
+            // the row.
+            let uptimeCalculator = await UptimeCalculator.getUptimeCalculator(this.id);
+            let endTimeDayjs = await uptimeCalculator.update(bean.status, parseFloat(bean.ping));
+            bean.end_time = R.isoDateTimeMillis(endTimeDayjs);
+
+            // Store the heartbeat BEFORE dispatching notifications. The
+            // incident-grouping defer logic in child monitors reads the
+            // parent's latest stored heartbeat to decide whether to stay
+            // silent — if the parent's DOWN row only landed after its (slow)
+            // Telegram delivery, children mistook the parent for UP and
+            // fired their own duplicate notifications.
+            log.debug("monitor", `[${this.name}] Store`);
+            await R.store(bean);
+
             // True when the incident grouping withheld this beat's notification
-            // (child folded into a parent incident or deferred to it). Forwarded
-            // on the socket payload so the UI records the beat but skips the
-            // duplicate popup toast for the root-cause alert.
+            // (child folded into a parent incident). Forwarded on the socket
+            // payload so the UI records the beat but skips the duplicate popup
+            // toast for the root-cause alert.
             let incidentSuppressed = false;
 
             // Mark as important if status changed, ignore pending pings,
             // Don't notify if disrupted changes to up
             if (isImportant) {
-                bean.important = true;
-
                 if (Monitor.isImportantForNotification(isFirstBeat, previousBeat?.status, bean.status)) {
                     log.debug("monitor", `[${this.name}] sendNotification`);
                     incidentSuppressed = await Monitor.sendNotification(isFirstBeat, this, bean);
@@ -1076,8 +1093,6 @@ class Monitor extends BeanModel {
 
                 await UptimeKumaServer.getInstance().sendMaintenanceListByUserID(this.user_id);
             } else {
-                bean.important = false;
-
                 if (bean.status === DOWN && this.resendInterval > 0) {
                     ++bean.downCount;
                     if (bean.downCount >= this.resendInterval) {
@@ -1163,11 +1178,6 @@ class Monitor extends BeanModel {
                 );
             }
 
-            // Calculate uptime
-            let uptimeCalculator = await UptimeCalculator.getUptimeCalculator(this.id);
-            let endTimeDayjs = await uptimeCalculator.update(bean.status, parseFloat(bean.ping));
-            bean.end_time = R.isoDateTimeMillis(endTimeDayjs);
-
             // Send to frontend
             log.debug("monitor", `[${this.name}] Send to socket`);
             const heartbeatData = bean.toJSON();
@@ -1178,10 +1188,6 @@ class Monitor extends BeanModel {
             }
             io.to(this.user_id).emit("heartbeat", heartbeatData);
             Monitor.sendStats(io, this.id, this.user_id);
-
-            // Store to database
-            log.debug("monitor", `[${this.name}] Store`);
-            await R.store(bean);
 
             log.debug("monitor", `[${this.name}] prometheus.update`);
             const data24h = uptimeCalculator.get24Hour();
@@ -1567,10 +1573,11 @@ class Monitor extends BeanModel {
      * @param {boolean} isFirstBeat Is this beat the first of this monitor?
      * @param {Monitor} monitor The monitor to send a notification about
      * @param {import("./heartbeat")} bean Status information about monitor
-     * @returns {Promise<boolean>} true when the incident grouping suppressed or
-     * withheld this beat's notification (child folded into a parent incident,
-     * or deferred while waiting on the parent's status). The caller marks the
-     * socket payload so the UI records the beat without a popup toast.
+     * @returns {Promise<boolean>} true when the incident grouping suppressed
+     * this beat's notification (child folded into a parent incident). The
+     * caller marks the socket payload so the UI records the beat without a
+     * popup toast. Deferred beats are NOT suppressed — the child is down and
+     * its popup shows immediately.
      */
     static async sendNotification(isFirstBeat, monitor, bean) {
         if (!isFirstBeat || bean.status === DOWN) {
@@ -1594,7 +1601,12 @@ class Monitor extends BeanModel {
                 }
                 if (decision.send === "deferred") {
                     await Monitor.scheduleDeferredNotification(monitor, bean, decision);
-                    return true;
+                    // Deferred is NOT suppressed: the child IS down and its
+                    // popup shows immediately. If the parent later folds it
+                    // in, only the Telegram side stays silent; if the parent
+                    // stays UP, the deferred re-fire delivers the standalone
+                    // notification to match the popup.
+                    return false;
                 }
                 // "standard" → fall through to the existing flow below
             } else if (bean.status === UP) {
