@@ -429,6 +429,49 @@ describe("computeDeferWindowMs", () => {
     });
 });
 
+describe("queryFlaggedChildren (regression: missing MAINTENANCE import)", () => {
+    let originalGetAll;
+    let originalGetRow;
+
+    beforeEach(() => {
+        originalGetAll = R.getAll;
+        originalGetRow = R.getRow;
+    });
+
+    afterEach(() => {
+        R.getAll = originalGetAll;
+        R.getRow = originalGetRow;
+    });
+
+    test("returns flagged children and excludes ones in MAINTENANCE", async () => {
+        R.getAll = async () => [{ id: 6, name: "api" }, { id: 7, name: "front" }];
+        R.getRow = async (sql, params) => {
+            if (/SELECT status/i.test(sql)) {
+                return { status: params[0] === 6 ? UP : MAINTENANCE };
+            }
+            return null;
+        };
+        const out = await IncidentTracker.queryFlaggedChildren(5);
+        assert.deepStrictEqual(out, [{ id: 6, name: "api" }]);
+    });
+
+    test("root handleDown folds flagged children without downFlaggedChildren option → incident-root", async () => {
+        // This is the path that dispatches the consolidated notification.
+        // Before the MAINTENANCE import fix, queryFlaggedChildren always
+        // returned [] (the ReferenceError was swallowed by its catch), so
+        // root monitors fell through to the standard per-monitor DOWN
+        // message instead of consolidating.
+        R.getAll = async () => [{ id: 6, name: "api" }];
+        const root = makeMonitor({ id: 5, name: "parent", parent: null });
+        const decision = await IncidentTracker.handleDown(root);
+        assert.strictEqual(decision.send, "incident-root");
+        assert.strictEqual(decision.rootMonitor.id, 5);
+        assert.deepStrictEqual(decision.affectedIds.sort(), [5, 6]);
+        // Incident recorded as notified so later beats don't re-fire.
+        assert.strictEqual(IncidentTracker.hasPendingIncidentForRoot(5), false);
+    });
+});
+
 describe("IncidentTracker message formatters", () => {
     test("DOWN message matches user's spec", () => {
         const msg = IncidentTracker.formatIncidentDownMessage(

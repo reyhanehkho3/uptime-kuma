@@ -102,6 +102,14 @@ const downState = new Map();
 const pendingDeferredNotifications = new Map();
 
 /**
+ * Maximum number of times a deferred DOWN notification may be re-deferred
+ * because the parent's latest heartbeat looks stale (its check still in
+ * flight). Bounds how long an orphaned child waits before firing its
+ * standalone notification when the parent never records a DOWN.
+ */
+const MAX_DEFER_RECHECKS = 2;
+
+/**
  * Get (or lazily initialise) the in-memory down-escalation state for a monitor.
  * @param {number} monitorID Monitor ID
  * @returns {{downStart: ?number, downAlertLevel: number}} Mutable state object
@@ -1038,6 +1046,12 @@ class Monitor extends BeanModel {
             log.debug("monitor", `[${this.name}] Check isImportant`);
             let isImportant = Monitor.isImportantBeat(isFirstBeat, previousBeat?.status, bean.status);
 
+            // True when the incident grouping withheld this beat's notification
+            // (child folded into a parent incident or deferred to it). Forwarded
+            // on the socket payload so the UI records the beat but skips the
+            // duplicate popup toast for the root-cause alert.
+            let incidentSuppressed = false;
+
             // Mark as important if status changed, ignore pending pings,
             // Don't notify if disrupted changes to up
             if (isImportant) {
@@ -1045,7 +1059,7 @@ class Monitor extends BeanModel {
 
                 if (Monitor.isImportantForNotification(isFirstBeat, previousBeat?.status, bean.status)) {
                     log.debug("monitor", `[${this.name}] sendNotification`);
-                    await Monitor.sendNotification(isFirstBeat, this, bean);
+                    incidentSuppressed = await Monitor.sendNotification(isFirstBeat, this, bean);
                 } else {
                     log.debug(
                         "monitor",
@@ -1156,7 +1170,13 @@ class Monitor extends BeanModel {
 
             // Send to frontend
             log.debug("monitor", `[${this.name}] Send to socket`);
-            io.to(this.user_id).emit("heartbeat", bean.toJSON());
+            const heartbeatData = bean.toJSON();
+            if (incidentSuppressed) {
+                // This beat's notification was folded into the root-cause
+                // incident alert — the UI should not pop a duplicate toast.
+                heartbeatData.incidentSuppressed = true;
+            }
+            io.to(this.user_id).emit("heartbeat", heartbeatData);
             Monitor.sendStats(io, this.id, this.user_id);
 
             // Store to database
@@ -1547,7 +1567,10 @@ class Monitor extends BeanModel {
      * @param {boolean} isFirstBeat Is this beat the first of this monitor?
      * @param {Monitor} monitor The monitor to send a notification about
      * @param {import("./heartbeat")} bean Status information about monitor
-     * @returns {Promise<void>}
+     * @returns {Promise<boolean>} true when the incident grouping suppressed or
+     * withheld this beat's notification (child folded into a parent incident,
+     * or deferred while waiting on the parent's status). The caller marks the
+     * socket payload so the UI records the beat without a popup toast.
      */
     static async sendNotification(isFirstBeat, monitor, bean) {
         if (!isFirstBeat || bean.status === DOWN) {
@@ -1563,15 +1586,15 @@ class Monitor extends BeanModel {
                         "monitor",
                         `[${monitor.name}] DOWN notification suppressed — covered by active incident for root monitor #${decision.rootMonitor?.id}`
                     );
-                    return;
+                    return true;
                 }
                 if (decision.send === "incident-root") {
                     await Monitor.dispatchIncidentDown(bean, decision);
-                    return;
+                    return false;
                 }
                 if (decision.send === "deferred") {
                     await Monitor.scheduleDeferredNotification(monitor, bean, decision);
-                    return;
+                    return true;
                 }
                 // "standard" → fall through to the existing flow below
             } else if (bean.status === UP) {
@@ -1581,17 +1604,18 @@ class Monitor extends BeanModel {
                         "monitor",
                         `[${monitor.name}] UP notification suppressed — affected monitor in active incident`
                     );
-                    return;
+                    return true;
                 }
                 if (decision.send === "incident-resolved") {
                     await Monitor.dispatchIncidentUp(monitor, bean, decision);
-                    return;
+                    return false;
                 }
                 // "standard" → fall through to the existing flow below
             }
 
             await Monitor.sendStandardNotification(monitor, bean);
         }
+        return false;
     }
 
     /**
@@ -1690,9 +1714,11 @@ class Monitor extends BeanModel {
      * @param {Monitor} monitor The monitor whose DOWN was deferred
      * @param {import("./heartbeat")} bean Heartbeat that triggered the original DOWN
      * @param {{rootMonitor: object, deferMs: number}} decision Decision from IncidentTracker.handleDown
+     * @param {number} [deferCount=0] How many times this notification has
+     * already been re-deferred waiting for the parent's status
      * @returns {Promise<void>}
      */
-    static async scheduleDeferredNotification(monitor, bean, decision) {
+    static async scheduleDeferredNotification(monitor, bean, decision, deferCount = 0) {
         // Clear any earlier pending defer for this monitor — we want at
         // most one outstanding fire per monitor at any time.
         if (pendingDeferredNotifications.has(monitor.id)) {
@@ -1724,7 +1750,34 @@ class Monitor extends BeanModel {
                     );
                     return;
                 }
-                // Parent is still UP after the defer window → genuine
+                // Parent is still UP after the defer window. Before
+                // declaring a genuine orphan, check whether the parent's
+                // latest heartbeat is actually fresh. If its last beat is
+                // older than one parent interval, the parent's current
+                // check is most likely still in flight (typically hanging
+                // on the same outage that took this child down) and its
+                // DOWN transition simply has not been recorded yet —
+                // re-defer instead of firing a premature duplicate
+                // notification. After MAX_DEFER_RECHECKS attempts (or when
+                // the parent goes fully stale), accept the orphan and fire.
+                const parentID = decision.rootMonitor?.id;
+                const parentInterval = decision.rootMonitor?.interval;
+                if (parentID && deferCount < MAX_DEFER_RECHECKS) {
+                    const lastBeatMs = await IncidentTracker.getLastBeatTimeMs(parentID);
+                    const intervalMs = Math.max(Number(parentInterval) || 60, 20) * 1000;
+                    if (lastBeatMs === null || Date.now() - lastBeatMs > intervalMs) {
+                        log.debug(
+                            "monitor",
+                            `[${monitor.name}] Parent #${parentID} heartbeat is stale (check likely in flight) — re-deferring orphan notification (attempt ${deferCount + 1}/${MAX_DEFER_RECHECKS})`
+                        );
+                        const deferMs = await IncidentTracker.computeDeferWindowMs(parentID, parentInterval);
+                        if (deferMs !== null) {
+                            await Monitor.scheduleDeferredNotification(monitor, bean, { ...decision, deferMs }, deferCount + 1);
+                            return;
+                        }
+                    }
+                }
+                // Parent is alive and checked UP recently → genuine
                 // orphan failure. Fire the child's standalone DOWN.
                 log.debug(
                     "monitor",

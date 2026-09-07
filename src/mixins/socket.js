@@ -215,7 +215,11 @@ export default {
                 // Add to important list if it is important
                 // Also toast
                 if (data.important) {
-                    if (this.monitorList[data.monitorID] !== undefined) {
+                    // Incident-grouped child beats are folded into the
+                    // root-cause monitor's consolidated notification, so
+                    // skip the duplicate popup for them. The beat itself
+                    // is still recorded in the heartbeat list below.
+                    if (this.monitorList[data.monitorID] !== undefined && !data.incidentSuppressed) {
                         if (data.status === 0) {
                             toast.error(`[${this.monitorList[data.monitorID].name}] [DOWN] ${data.msg}`, {
                                 timeout: getToastErrorTimeout(),

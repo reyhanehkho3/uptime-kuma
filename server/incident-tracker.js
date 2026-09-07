@@ -1,5 +1,5 @@
 const { R } = require("redbean-node");
-const { DOWN, PENDING } = require("../src/util");
+const { DOWN, PENDING, MAINTENANCE } = require("../src/util");
 
 /**
  * In-memory state for active root-cause incidents.
@@ -575,6 +575,8 @@ module.exports = {
     formatIncidentUpMessage,
     getMonitorsByIDs,
     getMonitorStatus,
+    getLastBeatTimeMs,
+    queryFlaggedChildren,
     computeDeferWindowMs,
     // Exposed for tests
     _incidents: incidents,
