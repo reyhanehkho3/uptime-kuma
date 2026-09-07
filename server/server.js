@@ -1484,9 +1484,15 @@ let needSetup = false;
                 }
 
                 // If the monitor is currently DOWN, the outage is still in progress —
-                // include its elapsed time as a candidate for the longest.
+                // include its elapsed time as a candidate for the longest. However,
+                // cap the ongoing window at the current server uptime so that a long
+                // period where Uptime Kuma itself was offline is not mis-attributed
+                // to the monitored service.
                 if (lastDownBeat) {
-                    const ongoingSec = Math.round((now - dayjs.utc(lastDownBeat.time).valueOf()) / 1000);
+                    const serverInstance = UptimeKumaServer.getInstance();
+                    const serverUptimeMs = serverInstance && serverInstance.startTime ? Math.max(0, Date.now() - serverInstance.startTime) : Number.MAX_SAFE_INTEGER;
+                    const ongoingMs = Math.min(now - dayjs.utc(lastDownBeat.time).valueOf(), serverUptimeMs);
+                    const ongoingSec = Math.round(ongoingMs / 1000);
                     if (ongoingSec > longestDowntime) {
                         longestDowntime = ongoingSec;
                     }

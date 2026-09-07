@@ -45,6 +45,7 @@ const {
 const { R } = require("redbean-node");
 const { BeanModel } = require("redbean-node/dist/bean-model");
 const { Notification } = require("../notification");
+const IncidentTracker = require("../incident-tracker");
 const { Proxy } = require("../proxy");
 const { demoMode } = require("../config");
 const version = require("../../package.json").version;
@@ -89,6 +90,16 @@ const SLOW_PING_DURATION_MS = 5 * 60 * 1000;
 // Monitor.checkSlowPingAlert for the load/save wiring.
 const slowPingState = new Map();
 const downState = new Map();
+
+/**
+ * Pending deferred DOWN notifications, keyed by monitor ID. The value
+ * is { timer, decision } — `timer` is the setTimeout handle and
+ * `decision` is the IncidentTracker.handleDown decision that produced it.
+ * Used by Monitor.scheduleDeferredNotification to deduplicate overlapping
+ * deferrals for the same monitor (the latest defer window supersedes
+ * earlier ones).
+ */
+const pendingDeferredNotifications = new Map();
 
 /**
  * Get (or lazily initialise) the in-memory down-escalation state for a monitor.
@@ -196,6 +207,7 @@ class Monitor extends BeanModel {
             weight: this.weight,
             active: preloadData.activeStatus.get(this.id),
             forceInactive: preloadData.forceInactive.get(this.id),
+            groupNotifications: Boolean(this.group_notifications),
             type: this.type,
             subtype: this.subtype,
             timeout: this.timeout,
@@ -1066,6 +1078,18 @@ class Monitor extends BeanModel {
                         bean.downCount = 0;
                     }
                 }
+
+                // Root-cause incident grouping: when this monitor is the
+                // root of an incident whose consolidated DOWN notification
+                // has not yet been dispatched (e.g., a child folded in
+                // AFTER this monitor's UP→DOWN beat), fire it now. Keeps
+                // the trigger on the root-cause monitor rather than on
+                // whichever dependent beats first, and works even when
+                // resendInterval is 0 (DOWN→DOWN beats never call
+                // sendNotification on their own).
+                if (bean.status === DOWN) {
+                    await Monitor.maybeFirePendingIncident(this, bean);
+                }
             }
 
             // Track sustained slow-ping periods and fire notifications via
@@ -1527,76 +1551,385 @@ class Monitor extends BeanModel {
      */
     static async sendNotification(isFirstBeat, monitor, bean) {
         if (!isFirstBeat || bean.status === DOWN) {
-            const fullNotificationList = await Monitor.getNotificationList(monitor);
-
-            // If this is a DOWN event, only send immediate notifications to
-            // legacy notifications (no escalationLevel in config) and those
-            // explicitly marked as escalationLevel 1 (developer). Notifications
-            // marked escalationLevel 2/3 will be sent later by the escalation
-            // state machine.
-            let notificationList = fullNotificationList;
+            // Root-cause incident grouping: when a monitor opts in via
+            // `groupNotifications`, this single hook decides whether the
+            // notification is suppressed (covered by an existing incident),
+            // consolidated (sent on behalf of the root-cause monitor), or
+            // falls through to the standard per-monitor flow.
             if (bean.status === DOWN) {
-                notificationList = fullNotificationList.filter((n) => {
-                    try {
-                        const cfg = JSON.parse(n.config || "{}");
-                        // if escalationLevel is not set, treat as legacy -> include
-                        if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) return true;
-                        return Number(cfg.escalationLevel) === 1;
-                    } catch (e) {
-                        return true;
-                    }
-                });
-            }
-
-            let text;
-            if (bean.status === UP) {
-                text = "✅ Up";
-            } else {
-                text = "🔴 Down";
-            }
-
-            let msg = `[${monitor.name}] [${text}] ${bean.msg}`;
-
-            const heartbeatJSON = await bean.toJSONAsync({ decodeResponse: true });
-            // Prevent if the msg is undefined, notifications such as Discord cannot send out.
-            if (!heartbeatJSON["msg"]) {
-                heartbeatJSON["msg"] = "N/A";
-            }
-
-            // Also provide the time in server timezone
-            heartbeatJSON["timezone"] = await UptimeKumaServer.getInstance().getTimezone();
-            heartbeatJSON["timezoneOffset"] = UptimeKumaServer.getInstance().getTimezoneOffset();
-            heartbeatJSON["localDateTime"] = dayjs
-                .utc(heartbeatJSON["time"])
-                .tz(heartbeatJSON["timezone"])
-                .format(SQL_DATETIME_FORMAT);
-
-            // Calculate downtime tracking information when service comes back up
-            // This makes downtime information available to all notification providers
-            if (bean.status === UP && monitor.id) {
-                try {
-                    // Filter by important = 1 to get the state transition heartbeat (e.g. UP→DOWN),
-                    // not the most recent DOWN heartbeat which would be the last check before recovery.
-                    const lastDownHeartbeat = await R.getRow(
-                        "SELECT time FROM heartbeat WHERE monitor_id = ? AND status = ? AND important = 1 ORDER BY time DESC LIMIT 1",
-                        [monitor.id, DOWN]
-                    );
-
-                    if (lastDownHeartbeat && lastDownHeartbeat.time) {
-                        heartbeatJSON["lastDownTime"] = lastDownHeartbeat.time;
-                    }
-                } catch (error) {
-                    // If we can't calculate downtime, just continue without it
-                    // Silently fail to avoid disrupting notification sending
+                const decision = await IncidentTracker.handleDown(monitor);
+                if (decision.send === "suppress") {
                     log.debug(
                         "monitor",
-                        `[${monitor.name}] Could not calculate downtime information: ${error.message}`
+                        `[${monitor.name}] DOWN notification suppressed — covered by active incident for root monitor #${decision.rootMonitor?.id}`
                     );
+                    return;
                 }
+                if (decision.send === "incident-root") {
+                    await Monitor.dispatchIncidentDown(bean, decision);
+                    return;
+                }
+                if (decision.send === "deferred") {
+                    await Monitor.scheduleDeferredNotification(monitor, bean, decision);
+                    return;
+                }
+                // "standard" → fall through to the existing flow below
+            } else if (bean.status === UP) {
+                const decision = await IncidentTracker.handleUp(monitor);
+                if (decision.send === "suppress") {
+                    log.debug(
+                        "monitor",
+                        `[${monitor.name}] UP notification suppressed — affected monitor in active incident`
+                    );
+                    return;
+                }
+                if (decision.send === "incident-resolved") {
+                    await Monitor.dispatchIncidentUp(monitor, bean, decision);
+                    return;
+                }
+                // "standard" → fall through to the existing flow below
             }
 
-            await Monitor.dispatchNotifications(monitor, notificationList, msg, heartbeatJSON);
+            await Monitor.sendStandardNotification(monitor, bean);
         }
+    }
+
+    /**
+     * Run the standard (non-incident-grouped) per-monitor notification flow:
+     * build the heartbeat envelope, apply escalation-level filtering for
+     * DOWN events, format the message, and dispatch to the monitor's
+     * notification list. Shared by sendNotification (synchronous path) and
+     * scheduleDeferredNotification (re-fire after the defer window).
+     * @param {Monitor} monitor The monitor to notify about
+     * @param {import("./heartbeat")} bean Heartbeat that triggered the notification
+     * @returns {Promise<void>}
+     */
+    static async sendStandardNotification(monitor, bean) {
+        const fullNotificationList = await Monitor.getNotificationList(monitor);
+
+        // If this is a DOWN event, only send immediate notifications to
+        // legacy notifications (no escalationLevel in config) and those
+        // explicitly marked as escalationLevel 1 (developer). Notifications
+        // marked escalationLevel 2/3 will be sent later by the escalation
+        // state machine.
+        let notificationList = fullNotificationList;
+        if (bean.status === DOWN) {
+            notificationList = fullNotificationList.filter((n) => {
+                try {
+                    const cfg = JSON.parse(n.config || "{}");
+                    // if escalationLevel is not set, treat as legacy -> include
+                    if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) return true;
+                    return Number(cfg.escalationLevel) === 1;
+                } catch (e) {
+                    return true;
+                }
+            });
+        }
+
+        let text;
+        if (bean.status === UP) {
+            text = "✅ Up";
+        } else {
+            text = "🔴 Down";
+        }
+
+        let msg = `[${monitor.name}] [${text}] ${bean.msg}`;
+
+        const heartbeatJSON = await bean.toJSONAsync({ decodeResponse: true });
+        // Prevent if the msg is undefined, notifications such as Discord cannot send out.
+        if (!heartbeatJSON["msg"]) {
+            heartbeatJSON["msg"] = "N/A";
+        }
+
+        // Also provide the time in server timezone
+        heartbeatJSON["timezone"] = await UptimeKumaServer.getInstance().getTimezone();
+        heartbeatJSON["timezoneOffset"] = UptimeKumaServer.getInstance().getTimezoneOffset();
+        heartbeatJSON["localDateTime"] = dayjs
+            .utc(heartbeatJSON["time"])
+            .tz(heartbeatJSON["timezone"])
+            .format(SQL_DATETIME_FORMAT);
+
+        // Calculate downtime tracking information when service comes back up
+        // This makes downtime information available to all notification providers
+        if (bean.status === UP && monitor.id) {
+            try {
+                // Filter by important = 1 to get the state transition heartbeat (e.g. UP→DOWN),
+                // not the most recent DOWN heartbeat which would be the last check before recovery.
+                const lastDownHeartbeat = await R.getRow(
+                    "SELECT time FROM heartbeat WHERE monitor_id = ? AND status = ? AND important = 1 ORDER BY time DESC LIMIT 1",
+                    [monitor.id, DOWN]
+                );
+
+                if (lastDownHeartbeat && lastDownHeartbeat.time) {
+                    heartbeatJSON["lastDownTime"] = lastDownHeartbeat.time;
+                }
+            } catch (error) {
+                // If we can't calculate downtime, just continue without it
+                // Silently fail to avoid disrupting notification sending
+                log.debug(
+                    "monitor",
+                    `[${monitor.name}] Could not calculate downtime information: ${error.message}`
+                );
+            }
+        }
+
+        await Monitor.dispatchNotifications(monitor, notificationList, msg, heartbeatJSON);
+    }
+
+    /**
+     * Re-evaluate the incident decision after `decision.deferMs` so the
+     * parent has a chance to record its own DOWN transition. If the
+     * parent has since gone DOWN, fold the child into the incident
+     * silently. If the parent is still UP (genuine orphan), fire the
+     * child's standalone DOWN notification via the standard path.
+     *
+     * Tracks pending deferred notifications per monitor so duplicate
+     * DOWN beats on the same monitor do not schedule overlapping fires
+     * (the latest defer window supersedes earlier ones).
+     *
+     * @param {Monitor} monitor The monitor whose DOWN was deferred
+     * @param {import("./heartbeat")} bean Heartbeat that triggered the original DOWN
+     * @param {{rootMonitor: object, deferMs: number}} decision Decision from IncidentTracker.handleDown
+     * @returns {Promise<void>}
+     */
+    static async scheduleDeferredNotification(monitor, bean, decision) {
+        // Clear any earlier pending defer for this monitor — we want at
+        // most one outstanding fire per monitor at any time.
+        if (pendingDeferredNotifications.has(monitor.id)) {
+            clearTimeout(pendingDeferredNotifications.get(monitor.id).timer);
+        }
+        log.debug(
+            "monitor",
+            `[${monitor.name}] DOWN notification deferred ${decision.deferMs}ms — re-checking parent status before firing`
+        );
+
+        const timer = setTimeout(async () => {
+            pendingDeferredNotifications.delete(monitor.id);
+            try {
+                // Re-call handleDown with the same parent. If the parent
+                // has since gone DOWN, this returns "suppress" and the
+                // child folds into the incident silently. If the parent
+                // is still UP, it returns "standard" and we fire the
+                // child's standalone. It cannot return "deferred" again
+                // because either parent is now DOWN (different branch) or
+                // parent is still UP (same branch — but we want to fire
+                // here, not defer again, so we check explicitly below).
+                const newDecision = await IncidentTracker.handleDown(monitor, {
+                    parent: decision.rootMonitor,
+                });
+                if (newDecision.send === "suppress" || newDecision.send === "incident-root") {
+                    log.debug(
+                        "monitor",
+                        `[${monitor.name}] Deferred DOWN notification absorbed by parent incident after parent went DOWN`
+                    );
+                    return;
+                }
+                // Parent is still UP after the defer window → genuine
+                // orphan failure. Fire the child's standalone DOWN.
+                log.debug(
+                    "monitor",
+                    `[${monitor.name}] Deferred DOWN notification firing — parent still UP, child is orphan`
+                );
+                await Monitor.sendStandardNotification(monitor, bean);
+            } catch (e) {
+                log.error("monitor", `Deferred notification for [${monitor.name}] failed: ${e?.message || e}`);
+            }
+        }, decision.deferMs);
+
+        pendingDeferredNotifications.set(monitor.id, { timer, decision });
+    }
+
+    /**
+     * Build the same heartbeatJSON envelope that the standard notification
+     * path constructs, so notification providers receive a uniform shape
+     * regardless of whether the message is per-monitor or incident-grouped.
+     * @param {import("./heartbeat")} bean Heartbeat that triggered the notification
+     * @returns {Promise<object>}
+     */
+    static async buildHeartbeatJSON(bean) {
+        const heartbeatJSON = await bean.toJSONAsync({ decodeResponse: true });
+        if (!heartbeatJSON["msg"]) {
+            heartbeatJSON["msg"] = "N/A";
+        }
+        heartbeatJSON["timezone"] = await UptimeKumaServer.getInstance().getTimezone();
+        heartbeatJSON["timezoneOffset"] = UptimeKumaServer.getInstance().getTimezoneOffset();
+        heartbeatJSON["localDateTime"] = dayjs
+            .utc(heartbeatJSON["time"])
+            .tz(heartbeatJSON["timezone"])
+            .format(SQL_DATETIME_FORMAT);
+        return heartbeatJSON;
+    }
+
+    /**
+     * Apply the same escalation-level filter the standard DOWN path uses,
+     * so the incident notification respects the legacy / level-1 only policy.
+     * @param {Array} fullNotificationList
+     * @returns {Array}
+     */
+    static filterImmediateDownNotifications(fullNotificationList) {
+        return fullNotificationList.filter((n) => {
+            try {
+                const cfg = JSON.parse(n.config || "{}");
+                if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) return true;
+                return Number(cfg.escalationLevel) === 1;
+            } catch (e) {
+                return true;
+            }
+        });
+    }
+
+    /**
+     * Dispatch a consolidated DOWN notification on behalf of the root-cause
+     * monitor for an active incident. Sends the "🔴 Incident detected" message
+     * to the root monitor's notification list (filtered to immediate tier).
+     * @param {import("./heartbeat")} bean Heartbeat from the triggering child monitor
+     * @param {{rootMonitor: object, affectedIds: number[]}} decision Decision from IncidentTracker.handleDown
+     * @returns {Promise<void>}
+     */
+    static async dispatchIncidentDown(bean, decision) {
+        const rootMonitor = decision.rootMonitor;
+        const rootFullList = await Monitor.getNotificationList(rootMonitor);
+        const rootNotificationList = Monitor.filterImmediateDownNotifications(rootFullList);
+
+        if (rootNotificationList.length === 0) {
+            log.debug(
+                "monitor",
+                `[${rootMonitor.name}] No immediate-tier notifications configured for root cause — incident consolidated notification skipped.`
+            );
+            return;
+        }
+
+        const affectedIDs = (decision.affectedIds || []).filter((id) => id !== rootMonitor.id);
+        const affectedMap = await IncidentTracker.getMonitorsByIDs(affectedIDs);
+        const affectedMonitors = affectedIDs.map((id) => affectedMap.get(id)).filter(Boolean);
+
+        const msg = IncidentTracker.formatIncidentDownMessage(
+            rootMonitor.name,
+            bean.msg || "unavailable",
+            affectedMonitors
+        );
+
+        const heartbeatJSON = await Monitor.buildHeartbeatJSON(bean);
+        heartbeatJSON.isIncident = true;
+        heartbeatJSON.incidentRootMonitorId = rootMonitor.id;
+        heartbeatJSON.incidentAffectedIds = affectedIDs;
+
+        log.debug(
+            "monitor",
+            `[Incident] Sending consolidated DOWN notification for root monitor #${rootMonitor.id} (${rootMonitor.name}) affecting ${affectedIDs.length} service(s)`
+        );
+
+        await Monitor.dispatchNotifications(rootMonitor, rootNotificationList, msg, heartbeatJSON);
+    }
+
+    /**
+     * Dispatch a consolidated UP notification when the root-cause monitor of
+     * an active incident recovers. Lists any still-affected children.
+     * @param {Monitor} monitor The recovering root monitor
+     * @param {import("./heartbeat")} bean Heartbeat that triggered the recovery
+     * @param {{rootMonitor: object, stillAffectedIds: number[]}} decision Decision from IncidentTracker.handleUp
+     * @returns {Promise<void>}
+     */
+    static async dispatchIncidentUp(monitor, bean, decision) {
+        // The root monitor's own notification list is used so the operator's
+        // existing channels receive the recovery alert.
+        const fullNotificationList = await Monitor.getNotificationList(monitor);
+        if (fullNotificationList.length === 0) {
+            log.debug(
+                "monitor",
+                `[Incident] No notifications configured for root monitor #${monitor.id} — incident resolved notification skipped.`
+            );
+            return;
+        }
+
+        const stillAffectedIds = decision.stillAffectedIds || [];
+        const affectedMap = await IncidentTracker.getMonitorsByIDs(stillAffectedIds);
+        const stillAffectedMonitors = stillAffectedIds.map((id) => affectedMap.get(id)).filter(Boolean);
+
+        const msg = IncidentTracker.formatIncidentUpMessage(monitor.name, stillAffectedMonitors);
+
+        const heartbeatJSON = await Monitor.buildHeartbeatJSON(bean);
+        heartbeatJSON.isIncident = true;
+        heartbeatJSON.isIncidentResolved = true;
+        heartbeatJSON.incidentRootMonitorId = monitor.id;
+        heartbeatJSON.incidentStillAffectedIds = stillAffectedIds;
+
+        log.debug(
+            "monitor",
+            `[Incident] Sending consolidated UP notification for root monitor #${monitor.id} (${monitor.name}); ${stillAffectedIds.length} still affected`
+        );
+
+        await Monitor.dispatchNotifications(monitor, fullNotificationList, msg, heartbeatJSON);
+
+        // Clear the down-escalation state so checkDownEscalation's UP branch
+        // (called later in the same beat) sees no pending escalation tier and
+        // does not double-notify about recovery. The consolidated incident
+        // notification above already informed the operator.
+        Monitor.clearDownEscalationState(monitor.id);
+    }
+
+    /**
+     * Reset the in-memory down-escalation state for a monitor without
+     * persisting. Used when another code path (incident resolution,
+     * dispatchIncidentUp) has already handled the recovery notification.
+     * @param {number} monitorID
+     * @returns {void}
+     */
+    static clearDownEscalationState(monitorID) {
+        const state = downState.get(monitorID);
+        if (!state) return;
+        state.downStart = null;
+        state.downAlertLevel = 0;
+    }
+
+    /**
+     * Called from the parent's beat loop on every DOWN→DOWN beat. If a
+     * child has folded into this monitor's incident since the last
+     * consolidated notification (or the parent had no flagged children at
+     * its UP→DOWN transition and only created the incident later when a
+     * child folded in), this method dispatches the consolidated DOWN
+     * notification on the parent's own channels. Keeps the root-cause
+     * monitor as the single trigger for the operator-facing alert.
+     * @param {Monitor} monitor The parent (root) monitor
+     * @param {import("./heartbeat")} bean Heartbeat that triggered this beat
+     * @returns {Promise<void>}
+     */
+    static async maybeFirePendingIncident(monitor, bean) {
+        if (!IncidentTracker.hasPendingIncidentForRoot(monitor.id)) {
+            return;
+        }
+        const decision = await IncidentTracker.handleDown(monitor);
+        if (decision.send === "incident-root") {
+            await Monitor.dispatchIncidentDown(bean, decision);
+        }
+    }
+
+    /**
+     * If the given monitor is the root of an active incident, append a list
+     * of affected services to a notification message. Used by the escalation
+     * chain so tier-2 / tier-3 outage messages mention the dependent
+     * services too.
+     * @param {Monitor} monitor Candidate root monitor
+     * @param {string} baseMsg Existing message text
+     * @returns {Promise<string>} Original message if no incident, or message + affected list
+     */
+    static async appendIncidentAffectedToMessage(monitor, baseMsg) {
+        if (!IncidentTracker.hasIncident(monitor.id)) {
+            return baseMsg;
+        }
+        const affectedIds = IncidentTracker.getAffectedIds(monitor.id);
+        if (affectedIds.length === 0) {
+            return baseMsg;
+        }
+        const affectedMap = await IncidentTracker.getMonitorsByIDs(affectedIds);
+        const affectedNames = affectedIds
+            .map((id) => affectedMap.get(id)?.name)
+            .filter(Boolean);
+        if (affectedNames.length === 0) {
+            return baseMsg;
+        }
+        const list = affectedNames.map((n) => `  • ${n}`).join("\n");
+        return `${baseMsg}\nAffected services:\n${list}`;
     }
 
     /**
@@ -1735,6 +2068,14 @@ class Monitor extends BeanModel {
         if (!monitor.active) return;
         if (bean.status === MAINTENANCE) return;
 
+        // If this monitor is folded into an active incident as an affected
+        // child, the root cause's escalation chain carries it — skip our own.
+        // On UP the IncidentTracker suppresses the per-monitor recovery; on
+        // DOWN we still want the root cause's DOWN message to lead.
+        if (IncidentTracker.isAffected(monitor.id)) {
+            return;
+        }
+
         const state = getDownState(monitor.id);
         const notificationList = await Monitor.getNotificationList(monitor);
 
@@ -1788,7 +2129,8 @@ class Monitor extends BeanModel {
                     heartbeatJSON.localDateTime = dayjs.utc(heartbeatJSON.time).tz(heartbeatJSON.timezone).format(SQL_DATETIME_FORMAT);
 
                     const msg = `[${monitor.name}] [⚠️ Prolonged outage] Service still down after ${Math.round(elapsed/1000)}s`;
-                    await Monitor.dispatchNotifications(monitor, techList, msg, heartbeatJSON);
+                    const finalMsg = await Monitor.appendIncidentAffectedToMessage(monitor, msg);
+                    await Monitor.dispatchNotifications(monitor, techList, finalMsg, heartbeatJSON);
                 }
                 state.downAlertLevel = 2;
                 await Monitor._persistDownState(monitor, state);
@@ -1806,7 +2148,8 @@ class Monitor extends BeanModel {
                     heartbeatJSON.localDateTime = dayjs.utc(heartbeatJSON.time).tz(heartbeatJSON.timezone).format(SQL_DATETIME_FORMAT);
 
                     const msg = `[${monitor.name}] [🚨 Outage] Service still down after ${Math.round(elapsed/1000)}s`;
-                    await Monitor.dispatchNotifications(monitor, adminList, msg, heartbeatJSON);
+                    const finalMsg = await Monitor.appendIncidentAffectedToMessage(monitor, msg);
+                    await Monitor.dispatchNotifications(monitor, adminList, finalMsg, heartbeatJSON);
                 }
                 state.downAlertLevel = 3;
                 await Monitor._persistDownState(monitor, state);
@@ -1846,6 +2189,24 @@ class Monitor extends BeanModel {
 
     /**
      * Send a slow-ping (or slow-ping-recovery) notification to every
+     * notification provider configured for this monitor. Mirrors the shape
+     * of Monitor.sendNotification so the existing provider ecosystem can
+     * handle it.
+     *
+     * Trade-off note: heartbeatJSON.status is intentionally set to DOWN for
+     * the slow alert (UP for the recovery) so that providers branching on
+     * status === UP/DOWN (Discord, Slack, Telegram, etc. — 51 of them)
+     * still send something instead of nothing. The downside is that default Discord/Slack
+     * embeds render the "went down" template even though the service is
+     * still UP and just slow. The msg + isSlowPing/isSlowPingRecovery
+     * fields make the actual story unambiguous. A future improvement
+     * could introduce a SLOW_PING status (4) and update a few providers
+     * to special-case it; that's out of scope here.
+     * @param {Monitor} monitor The monitor the alert is about
+     * @param {import("./heartbeat")} bean The beat that triggered the alert
+     * @param {boolean} isRecovered True if this is a recovery notification
+     * @returns {Promise<void>}
+     */
     static async sendSlowPingNotification(monitor, bean, isRecovered) {
         const notificationList = await Monitor.getNotificationList(monitor);
 

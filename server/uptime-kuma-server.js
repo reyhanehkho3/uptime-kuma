@@ -83,6 +83,8 @@ class UptimeKumaServer {
         axios.defaults.timeout = 300 * 1000;
 
         log.info("server", "Creating express and socket.io instance");
+        // Record server start time to help differentiate uptime-kuma downtime from monitored service outages
+        this.startTime = Date.now();
         this.app = express();
         if (isSSL) {
             log.info("server", "Server Type: HTTPS");
