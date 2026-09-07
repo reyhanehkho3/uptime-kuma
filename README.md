@@ -34,6 +34,10 @@ It is a temporary live demo, all data will be deleted after 10 minutes. Sponsore
 - Certificate info
 - Proxy support
 - 2FA support
+- **Longest downtime tracking** — each monitor keeps a record of its longest outage since creation, surfaced on the monitor's Details page
+- **Slow-ping alerts** — get notified when a monitor's response time stays above 1000 ms for 30+ continuous seconds, even if it never goes DOWN, with a recovery notification when latency returns to normal
+- **Root-cause incident grouping** — declare a parent monitor as a dependency; when the parent and its children go down together, a single consolidated notification is sent naming the parent as the root cause instead of one alert per child
+- **Notification escalation levels** — assign each notification provider a tier (Developer / Tech Lead / Admin) so root-cause incidents can escalate through on-call levels instead of paging everyone at once
 
 ## 🔧 How to Install
 
