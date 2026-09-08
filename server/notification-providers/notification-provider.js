@@ -65,12 +65,11 @@ class NotificationProvider {
     }
 
     /**
-     * Renders a message template with notification context
-     * @param {string} template the template
-     * @param {string} msg the message that will be included in the context
-     * @param {?object} monitorJSON Monitor details (For Up/Down/Cert-Expiry only)
-     * @param {?object} heartbeatJSON Heartbeat details (For Up/Down only)
-     * @returns {Promise<string>} rendered template
+     * Compute a human-readable status label for a heartbeat, taking
+     * slow-ping markers into account. Falls back to "⚠️ Test" when no
+     * heartbeat is attached (used by the "test" notification button).
+     * @param {?object} heartbeatJSON Heartbeat envelope or null
+     * @returns {string} Localized status label (emoji + text)
      */
     getStatusLabel(heartbeatJSON) {
         if (!heartbeatJSON) {
@@ -88,6 +87,14 @@ class NotificationProvider {
         return heartbeatJSON.status === DOWN ? "🔴 Down" : "✅ Up";
     }
 
+    /**
+     * Renders a message template with notification context
+     * @param {string} template the template
+     * @param {string} msg the message that will be included in the context
+     * @param {?object} monitorJSON Monitor details (For Up/Down/Cert-Expiry only)
+     * @param {?object} heartbeatJSON Heartbeat details (For Up/Down only)
+     * @returns {Promise<string>} rendered template
+     */
     async renderTemplate(template, msg, monitorJSON, heartbeatJSON) {
         const engine = new Liquid({
             root: "./no-such-directory-uptime-kuma",

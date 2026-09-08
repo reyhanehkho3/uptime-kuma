@@ -1448,7 +1448,7 @@ let needSetup = false;
             try {
                 checkLogin(socket);
 
-                const monitor = await R.findOne("monitor", " id = ? ", [monitorID]);
+                const monitor = await R.findOne("monitor", " id = ? AND user_id = ? ", [monitorID, socket.userID]);
                 if (!monitor) {
                     throw new Error("Monitor not found");
                 }

@@ -118,7 +118,9 @@ describe("PART A — Bug demonstrations (red until fixed)", () => {
         // documented expectations. If any of these flip to scoped=true,
         // remove the L5.4 note from Invarients.md.
         for (const f of findings) {
-            if (f.status === "no-monitor-query-found") continue;
+            if (f.status === "no-monitor-query-found") {
+                continue;
+            }
             // eslint-disable-next-line no-console
             console.log(`  L5.4 inventory: ${f.event} → scoped=${f.scoped}, WHERE=${JSON.stringify(f.where)}`);
         }
@@ -868,5 +870,453 @@ describe("PART B — Longest downtime edge cases", () => {
         // Only 60s counts (the only inner beat); the 9-min stale tail is
         // excluded as "Uptime Kuma was offline".
         assert.strictEqual(duration, 60);
+    });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// PART C — Newly-found bugs in the 4 features (red until fixed)
+// ───────────────────────────────────────────────────────────────────────────
+//
+// These tests cover bugs found in a deeper audit after PART A/B. Each one
+// FAILS today and PASSES once the bug is fixed. They are listed in the same
+// order as the bug report.
+
+describe("PART C — Newly-found bugs (red until fixed)", () => {
+    /**
+     * C1 — Bug #1: Escalation state lost on every server restart.
+     *
+     * `monitor.slow_ping_start` and `monitor.slow_ping_alert_sent` are
+     * restored from DB on `start()` (see monitor.js:496-504), but
+     * `monitor.down_start` and `monitor.down_alert_level` are written on
+     * every state change (`_persistDownState`) and never read back.
+     *
+     * Consequence: after a restart mid-escalation, the level-1 / level-2
+     * notifications fire a second time (or are delayed by a full restart-
+     * to-restart window), because the in-memory `downState` Map is
+     * reinitialized from defaults.
+     *
+     * Fix: add a restoration block in `start()` analogous to the slow-ping
+     * one — when `this.downStart != null || this.downAlertLevel > 0`,
+     * push the values into `getDownState(this.id)`.
+     */
+    test("C1. start() must restore downStart and downAlertLevel from DB columns", async () => {
+        const source = await fs.readFile("server/model/monitor.js", "utf-8");
+
+        // Find the body of start() up to (but not past) the prometheus
+        // initialization. The down-escalation restore should live alongside
+        // the slow-ping restore, BEFORE rootCertificates/prometheus init.
+        const startBody = source.match(
+            /async start\(io\)\s*\{[\s\S]*?this\.prometheus\s*=\s*new Prometheus/
+        );
+
+        assert.ok(
+            startBody,
+            "expected to find start() function body up to `this.rootCertificates =`"
+        );
+
+        // The start() body should reference this.downStart OR this.down_start.
+        // redbean-node reads from the snake_case column, so both forms are
+        // plausible — the test accepts either.
+        const referencesDownStart = /this\.downStart\b|this\.down_start\b/.test(startBody[0]);
+        const referencesDownAlertLevel = /this\.downAlertLevel\b|this\.down_alert_level\b/.test(
+            startBody[0]
+        );
+
+        assert.ok(
+            referencesDownStart,
+            "BUG #1: start() must reference monitor.downStart (or its DB column form) " +
+                "to restore the in-memory downState across restarts. Today the column is " +
+                "written by _persistDownState but never read."
+        );
+
+        assert.ok(
+            referencesDownAlertLevel,
+            "BUG #1: start() must reference monitor.downAlertLevel (or its DB column form) " +
+                "to restore the in-memory downState across restarts."
+        );
+    });
+
+    /**
+     * C2 — Bug #2: pendingDeferredNotifications not cleared on stop().
+     *
+     * When a child monitor goes DOWN and is deferred, the timer handle is
+     * stored in the module-level `pendingDeferredNotifications` Map. If the
+     * monitor is then stopped (or deleted) before the timer fires, the
+     * timer still fires and the callback calls `Monitor.sendStandardNotification`
+     * on a monitor that may no longer be checked.
+     *
+     * Fix: in `stop()`, look up any pending timer for `this.id` and
+     * `clearTimeout(...)` it, then delete the map entry.
+     */
+    test("C2. stop() must clear any pending deferred notifications", async () => {
+        const source = await fs.readFile("server/model/monitor.js", "utf-8");
+
+        const stopBody = source.match(/async stop\(\)\s*\{[\s\S]*?\n    \}/);
+        assert.ok(stopBody, "expected to find Monitor.stop() function body");
+
+        assert.ok(
+            /pendingDeferredNotifications/.test(stopBody[0]),
+            "BUG #2: Monitor.stop() must clean up pendingDeferredNotifications. " +
+                "Otherwise a deferred DOWN timer fires after the monitor is stopped, " +
+                "sending a stray notification."
+        );
+    });
+
+    /**
+     * C3 — Bug #3: Duplicate recovery notifications on UP after escalation.
+     *
+     * Today, on a DOWN→UP transition for a monitor that was in escalation
+     * (downAlertLevel >= 1):
+     *   1. `sendStandardNotification` fires `"[Name] [✅ Up] msg"` to ALL
+     *      notifications (no DOWN-filter applies for UP).
+     *   2. `checkDownEscalation` fires `"[Name] [✅ Recovered] Service
+     *      recovered after Xs"` to the filtered set (escalationLevel <=
+     *      state.downAlertLevel).
+     *
+     * For non-root monitors, both fire — the operator gets TWO recovery
+     * messages. (Root monitors avoid this because `dispatchIncidentUp`
+     * calls `clearDownEscalationState` before `checkDownEscalation` runs.)
+     *
+     * The fix should coordinate the two paths so only ONE recovery
+     * notification fires per UP beat after escalation.
+     */
+    test("C3. UP recovery after escalation must not fire duplicate notifications", async () => {
+        const source = await fs.readFile("server/model/monitor.js", "utf-8");
+
+        // Locate sendStandardNotification and checkDownEscalation.
+        const sendStandard = source.match(
+            /static\s+async\s+sendStandardNotification[\s\S]*?\n\s{4}\}/m
+        );
+        const checkEscalation = source.match(
+            /static\s+async\s+checkDownEscalation[\s\S]*?\n\s{4}\}/m
+        );
+
+        assert.ok(sendStandard, "expected to find sendStandardNotification");
+        assert.ok(checkEscalation, "expected to find checkDownEscalation");
+
+        // After the fix, the UP path in sendStandardNotification should be
+        // skipped (or its message suppressed) when downAlertLevel > 0, OR
+        // the recovery branch in checkDownEscalation should be the no-op
+        // in that case. Pin a coordination marker.
+        //
+        // The simplest "coordination marker" pattern we accept:
+        //   - `sendStandardNotification`'s UP branch reads a shared flag set by the recovery path, OR
+        //   - `checkDownEscalation`'s recovery branch returns early when the standard UP was sent, OR
+        //   - The two messages are merged into one dispatch.
+        //
+        // The test asserts that at least ONE of these coordination patterns
+        // is present. Today, none are — so the test fails.
+
+        const upTextInSendStandard = /text\s*=\s*"✅ Up"/.test(sendStandard[0]);
+        const recoveryInCheckEscalation = /\[✅ Recovered\]/.test(checkEscalation[0]);
+
+        // Both messages exist. Now check whether they coordinate.
+        // Look for any coordination marker: a shared module-level flag,
+        // a guard like `if (recoveryAlreadySent)`, or a function call
+        // between them.
+        const hasSharedFlag =
+            /\bsentStandardUp\b|\brecoveryFired\b|\bupHandled\b/.test(source);
+        const hasEarlyReturnInEscalation =
+            /if\s*\(\s*recoverySent\s*\)|if\s*\(\s*!recoverySent\s*\)|return\s*;\s*\/\/\s*recovery/i.test(
+                checkEscalation[0]
+            );
+        const sendStandardChecksEscalation =
+            /downAlertLevel/.test(sendStandard[0]);
+
+        assert.ok(
+            hasSharedFlag || hasEarlyReturnInEscalation || sendStandardChecksEscalation,
+            "BUG #3: sendStandardNotification and checkDownEscalation fire duplicate UP " +
+                "notifications today. After the fix, at least one of these coordination " +
+                "patterns must be in place:\n" +
+                "  - a shared `recoverySent` flag, OR\n" +
+                "  - checkDownEscalation's recovery branch returning early, OR\n" +
+                "  - sendStandardNotification gating the UP branch on downAlertLevel.\n" +
+                "Today, none are present — non-root monitors in escalation get TWO " +
+                "recovery messages on the same UP beat."
+        );
+
+        // Sanity: both messages still exist (the fix shouldn't drop one).
+        assert.ok(upTextInSendStandard, "sendStandardNotification should still send '✅ Up'");
+        assert.ok(recoveryInCheckEscalation, "checkDownEscalation should still send '✅ Recovered'");
+    });
+
+    /**
+     * C4 — Bug #4: Silent failure mode for malformed escalationLevel.
+     *
+     * The escalation filter is `Number(cfg.escalationLevel) === level`.
+     * Malformed values like 1.5, "foo", NaN, -1 are silently excluded
+     * from every tier — the user gets no signal that anything's wrong.
+     *
+     * Fix: log a warning (or fall back to legacy) when the value is not a
+     * positive integer in {1, 2, 3}.
+     */
+    test("C4. malformed escalationLevel must not silently exclude notifications", async () => {
+        // Re-implement the filter to verify the current behavior. After the
+        // fix, the filter (or a wrapper) should log a warning AND/OR fall
+        // back to a sensible default for malformed values.
+        const filterByLevel = (configStr, level) => {
+            try {
+                const cfg = JSON.parse(configStr || "{}");
+                if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) {
+                    return level === 1;
+                }
+                return Number(cfg.escalationLevel) === level;
+            } catch (e) {
+                return level === 1;
+            }
+        };
+
+        // Capture log.warn calls.
+        const warnings = [];
+        const origWarn = console.warn;
+        console.warn = (...args) => warnings.push(args.join(" "));
+
+        try {
+            // Today these all silently return false:
+            assert.strictEqual(filterByLevel('{"escalationLevel": 1.5}', 1), false);
+            assert.strictEqual(filterByLevel('{"escalationLevel": 1.5}', 2), false);
+            assert.strictEqual(filterByLevel('{"escalationLevel": "foo"}', 1), false);
+            assert.strictEqual(filterByLevel('{"escalationLevel": -1}', 1), false);
+
+            // After the fix, at least ONE of these warnings should have been
+            // emitted for the malformed values. Today, the production code
+            // does not log anything — `console.warn` is only a stand-in for
+            // the production logger. The source-level check below covers
+            // the production code path.
+            const filteredValues = warnings.filter((w) => w.includes("escalationLevel"));
+            // We deliberately don't assert.strictEqual the count here —
+            // because the production code doesn't use console.warn. The
+            // source-level check in the next step is the real gate.
+        } finally {
+            console.warn = origWarn;
+        }
+
+        // Source-level check: the production filter must log a warning
+        // (or otherwise surface) when escalationLevel is not a valid level.
+        const source = await fs.readFile("server/model/monitor.js", "utf-8");
+
+        // The filter for level-1 / level-2 / level-3 lives in
+        // sendStandardNotification and checkDownEscalation. At least one
+        // of those branches must emit a log line for malformed values.
+        const filterLocation =
+            /cfg\.escalationLevel\s*===\s*undefined\s*\|\|\s*cfg\.escalationLevel\s*===\s*null/;
+        const filterBlockMatch = source.match(filterLocation);
+
+        assert.ok(
+            filterBlockMatch,
+            "expected to find the legacy/null escalationLevel check in monitor.js"
+        );
+
+        // Walk the function body around the filter. Today, neither branch
+        // emits a log.warn / log.error for malformed (non-null, non-undefined)
+        // values.
+        //
+        // We grep for `Number.isInteger(...)` or `Number.isFinite(...)` near
+        // an escalationLevel check. The fix typically extracts the value to
+        // a local variable and validates with Number.isInteger / isFinite
+        // before comparing.
+        const hasDefensiveValidation =
+            /Number\.isInteger\(|Number\.isFinite\(/.test(source) &&
+            /escalationLevel/.test(source);
+
+        assert.ok(
+            hasDefensiveValidation,
+            "BUG #4: malformed escalationLevel values (1.5, 'foo', NaN, -1) are silently " +
+                "excluded from every tier today. The production filter must validate the " +
+                "value with Number.isInteger or Number.isFinite and log a warning for " +
+                "anything outside {1, 2, 3}."
+        );
+    });
+
+    /**
+     * C5 — Bug #5: Resend cycle doesn't include affected services list
+     * (misleading comment at incident-tracker.js:351-366).
+     *
+     * The comment says "the next resend cycle or escalation will mention
+     * newly added children". In practice, the escalation does (via
+     * `appendIncidentAffectedToMessage`), but the resend cycle does NOT —
+     * it fires the plain `[A] [🔴 Down] msg` from sendStandardNotification.
+     *
+     * Fix: update sendStandardNotification's DOWN message to consult the
+     * IncidentTracker and append the affected services list. This benefits
+     * both the initial DOWN notification AND the resend cycle (since
+     * sendNotification → IncidentTracker.handleDown → "standard" →
+     * sendStandardNotification).
+     */
+    test("C5. DOWN notifications must include affected services when an incident is active", async () => {
+        const source = await fs.readFile("server/model/monitor.js", "utf-8");
+
+        // Locate sendStandardNotification.
+        const sendStandard = source.match(
+            /static\s+async\s+sendStandardNotification[\s\S]*?\n\s{4}\}/m
+        );
+        assert.ok(sendStandard, "expected to find sendStandardNotification");
+
+        // The fix must consult the IncidentTracker for affected children
+        // and append them to the message — either via the helper or by
+        // reading the Map directly.
+        const usesAffectedInStandard =
+            /appendIncidentAffectedToMessage/.test(sendStandard[0]) ||
+            /IncidentTracker\.getAffectedIds/.test(sendStandard[0]) ||
+            /IncidentTracker\.hasIncident/.test(sendStandard[0]);
+
+        assert.ok(
+            usesAffectedInStandard,
+            "BUG #5: the comment at incident-tracker.js:351-366 says the resend cycle will " +
+                "mention newly added children. In practice it doesn't — the operator gets a " +
+                "plain `[A] [🔴 Down] msg` instead. After the fix, sendStandardNotification " +
+                "must consult IncidentTracker and append the affected list, OR the comment must " +
+                "be updated to match reality. Today the comment lies."
+        );
+    });
+
+    /**
+     * C6 — Bug #6: Fire-and-forget persistence — DB writes can complete
+     * out of order on slow connections.
+     *
+     * `_persistSlowPingState` and `_persistDownState` are called without
+     * `await` at multiple call sites in monitor.js. On SQLite the local
+     * write is fast and unlikely to reorder, but on MariaDB/MySQL over a
+     * network, two `R.store(monitor)` calls in quick succession can
+     * complete in non-deterministic order — leaving the DB with a state
+     * from the FIRST write after a SECOND write's response arrives.
+     *
+     * Fix: `await` both persistence calls.
+     */
+    test("C6. _persistSlowPingState and _persistDownState must be awaited at every call site", async () => {
+        const source = await fs.readFile("server/model/monitor.js", "utf-8");
+
+        // Find every call to these two helpers. Allow optional `await ` prefix.
+        const persistCalls = source.match(
+            /^[ \t]*(?:await\s+)?Monitor\._persist(?:SlowPing|Down)State\([^)]*\);?/gm
+        ) || [];
+
+        // Exclude the function-definition lines.
+        const callSites = persistCalls.filter((c) => !c.includes("async _persist"));
+
+        assert.ok(
+            callSites.length >= 5,
+            `expected at least 5 call sites; found ${callSites.length}:\n${callSites.join("\n")}`
+        );
+
+        for (const call of callSites) {
+            assert.ok(
+                /^\s*await\s+Monitor\._persist/.test(call),
+                `BUG #6: persistence call must be awaited to prevent DB write reordering. ` +
+                    `Offending line: "${call.trim()}"`
+            );
+        }
+    });
+
+    /**
+     * C7 — Bug #8: Slow-ping recovery message wording vs. comparison direction.
+     *
+     * Today the recovery fires when `bean.ping > SLOW_PING_THRESHOLD_MS`
+     * becomes false (i.e., `bean.ping <= 1000`). The detail message says
+     * "back below 1000 ms" — which is wrong at exactly 1000ms (it's at,
+     * not below). Either the message must say "at or below" or the
+     * comparison must use `>=`.
+     *
+     * The fix is cosmetic but the message must not contradict the actual
+     * code path.
+     */
+    test("C7. slow-ping recovery detail must match the comparison direction at boundary", async () => {
+        const source = await fs.readFile("server/model/monitor.js", "utf-8");
+
+        // The recovery trigger is `overThreshold = bean.ping > SLOW_PING_THRESHOLD_MS`
+        // (so the recovery fires when overThreshold becomes false, i.e.,
+        // `bean.ping <= SLOW_PING_THRESHOLD_MS`).
+        const comparisonIsStrict = /overThreshold\s*=\s*bean\.ping\s*>\s*SLOW_PING_THRESHOLD_MS/.test(
+            source
+        );
+
+        assert.ok(
+            comparisonIsStrict,
+            "expected the slow-ping threshold check to be `bean.ping > SLOW_PING_THRESHOLD_MS`"
+        );
+
+        // The recovery detail string is constructed at the bottom of
+        // sendSlowPingNotification.
+        const recoveryDetailMatch = source.match(
+            /isRecovered\s*\?\s*[`'"]([^`'"]*)back below([`'"])/
+        );
+
+        // We don't require a specific regex match — we just check the
+        // broader pattern. If the literal "back below" appears in the
+        // recovery branch, AND the comparison is strict `>`, that's the
+        // boundary inconsistency.
+        const hasBackBelow = /back below/.test(source);
+
+        if (comparisonIsStrict && hasBackBelow) {
+            // Today this is the bug. The fix should either:
+            //   - change the message to "at or below" / "back to", OR
+            //   - change the comparison to `>=`.
+            //
+            // We assert that the recovery message no longer says "back below"
+            // (since that's misleading at exactly 1000ms with `>` comparison).
+            assert.fail(
+                "BUG #8: slow-ping recovery message says 'back below' but the threshold " +
+                    "check is `bean.ping > SLOW_PING_THRESHOLD_MS`. At exactly 1000ms, " +
+                    "the recovery fires but the message is wrong. Change the message to " +
+                    "'at or below' or change the comparison to `>=`."
+            );
+        }
+
+        // If neither "back below" exists nor the strict comparison, the
+        // bug is implicitly fixed. Pass.
+    });
+
+    /**
+     * C8 — Cross-check: all 4 features coexist correctly.
+     *
+     * Verify that the four features don't interfere with each other:
+     *   - slow-ping alert and DOWN alert can both fire for the same beat
+     *     (slow-ping uses dispatchNotifications directly; DOWN goes through
+     *     sendNotification → IncidentTracker).
+     *   - escalation runs even when incident grouping is active (root monitor
+     *     is NOT in `affectedToRoot` so `IncidentTracker.isAffected(id)` is
+     *     false for it).
+     *   - longest downtime doesn't break incident grouping (it's a separate
+     *     socket handler).
+     */
+    test("C8. the 4 features do not interfere with each other", async () => {
+        const source = await fs.readFile("server/model/monitor.js", "utf-8");
+
+        // checkSlowPingAlert and checkDownEscalation are independent of
+        // IncidentTracker — slow-ping uses dispatchNotifications directly,
+        // escalation only consults IncidentTracker to skip "affected" monitors.
+
+        // Slow-ping must NOT consult IncidentTracker (slow-ping is status-
+        // independent).
+        const slowPingBody = source.match(
+            /static\s+async\s+checkSlowPingAlert[\s\S]*?\n\s{4}\}/m
+        );
+        assert.ok(slowPingBody);
+        assert.ok(
+            !/IncidentTracker\.isAffected/.test(slowPingBody[0]),
+            "checkSlowPingAlert must not skip when IncidentTracker.isAffected is true " +
+                "(slow-ping is status-independent — affected children should still get " +
+                "their own slow-ping alerts)."
+        );
+
+        // Escalation MUST consult IncidentTracker (affected children
+        // should be silent — root's escalation chain carries them).
+        const escalationBody = source.match(
+            /static\s+async\s+checkDownEscalation[\s\S]*?\n\s{4}\}/m
+        );
+        assert.ok(escalationBody);
+        assert.ok(
+            /IncidentTracker\.isAffected/.test(escalationBody[0]),
+            "checkDownEscalation must skip when IncidentTracker.isAffected is true " +
+                "(the root's escalation chain carries affected children)."
+        );
+
+        // Longest downtime is a separate socket handler — it doesn't share
+        // state with the beat loop. Just verify it lives in server.js.
+        const serverSource = await fs.readFile("server/server.js", "utf-8");
+        assert.ok(
+            /socket\.on\(\s*["']getLongestDowntime["']/.test(serverSource),
+            "getLongestDowntime handler should exist in server.js"
+        );
     });
 });

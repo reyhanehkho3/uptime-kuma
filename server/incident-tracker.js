@@ -88,6 +88,7 @@ function removeAffected(rootMonitorId, childMonitorId) {
 
 /**
  * Mark the consolidated root-cause DOWN notification as sent for an incident.
+ * @param rootMonitorId
  */
 function markRootNotified(rootMonitorId) {
     const inc = getOrCreate(rootMonitorId);
@@ -96,6 +97,8 @@ function markRootNotified(rootMonitorId) {
 
 /**
  * Record that a given escalation tier has been notified for the root.
+ * @param rootMonitorId
+ * @param level
  */
 function markEscalated(rootMonitorId, level) {
     const inc = getOrCreate(rootMonitorId);
@@ -104,6 +107,7 @@ function markEscalated(rootMonitorId, level) {
 
 /**
  * Return the set of escalation tiers already notified for the root (or empty set).
+ * @param rootMonitorId
  */
 function getEscalatedLevels(rootMonitorId) {
     const inc = incidents.get(rootMonitorId);
@@ -112,6 +116,7 @@ function getEscalatedLevels(rootMonitorId) {
 
 /**
  * Get the affected monitor IDs for an incident (empty if no incident).
+ * @param rootMonitorId
  */
 function getAffectedIds(rootMonitorId) {
     const inc = incidents.get(rootMonitorId);
@@ -120,6 +125,7 @@ function getAffectedIds(rootMonitorId) {
 
 /**
  * Check whether an incident exists and is still active for a given root monitor.
+ * @param rootMonitorId
  */
 function hasIncident(rootMonitorId) {
     return incidents.has(rootMonitorId);
@@ -131,6 +137,7 @@ function hasIncident(rootMonitorId) {
  * this on every DOWN→DOWN beat; while it's true, the parent will fire the
  * consolidated notification on its own beat instead of waiting for a
  * resend-interval or the next UP→DOWN transition.
+ * @param rootMonitorId
  */
 function hasPendingIncidentForRoot(rootMonitorId) {
     const inc = incidents.get(rootMonitorId);
@@ -139,6 +146,7 @@ function hasPendingIncidentForRoot(rootMonitorId) {
 
 /**
  * Clear an incident entirely. Used when the root recovers.
+ * @param rootMonitorId
  */
 function clear(rootMonitorId) {
     const inc = incidents.get(rootMonitorId);
@@ -185,8 +193,7 @@ async function getLastBeatTimeMs(monitorID) {
  * notification immediately in that case, since the parent is unlikely to
  * fail in lockstep with the child.
  *
- *   parentInterval = max(monitor.interval, 20) (matches Monitor.beat's clamp)
- *
+ * parentInterval = max(monitor.interval, 20) (matches Monitor.beat's clamp)
  * @param {number} parentID
  * @param {number|null} parentIntervalSec Value from monitor.interval column (or null if not loaded)
  * @returns {Promise<number|null>} Defer window in ms, or null if parent is stale
@@ -229,7 +236,9 @@ async function computeDeferWindowMs(parentID, parentIntervalSec) {
  * @returns {Promise<Array<{id: number, name: string}>>}
  */
 async function queryFlaggedChildren(rootMonitorId) {
-    if (!rootMonitorId) return [];
+    if (!rootMonitorId) {
+        return [];
+    }
     try {
         const rows = await R.getAll(
             `SELECT m.id, m.name
@@ -239,7 +248,9 @@ async function queryFlaggedChildren(rootMonitorId) {
                AND m.active = 1`,
             [rootMonitorId]
         );
-        if (!rows || rows.length === 0) return [];
+        if (!rows || rows.length === 0) {
+            return [];
+        }
 
         // Filter out anyone whose most recent heartbeat is MAINTENANCE — those
         // aren't really in production and shouldn't be reported as affected.
@@ -298,10 +309,10 @@ async function queryFlaggedDownChildren(rootMonitorId) {
  * Accepts an optional `options.parent` to skip the DB lookup; useful for tests
  * and for callers that already have the parent row loaded.
  * @param {object} monitor The monitor that just transitioned to DOWN
- * @param {object} [options]
- * @param {{id: number, name: string, interval?: number}} [options.parent] Pre-loaded parent monitor row
- * @param {number} [options.parentStatus] Pre-loaded parent heartbeat status (UP/DOWN/PENDING/MAINTENANCE)
- * @param {Array<{id: number, name: string}>} [options.downFlaggedChildren] Pre-loaded list of flagged children currently DOWN (used when this monitor is the root of an incident)
+ * @param {object} options
+ * @param {{id: number, name: string, interval?: number}} options.parent Pre-loaded parent monitor row
+ * @param {number} options.parentStatus Pre-loaded parent heartbeat status (UP/DOWN/PENDING/MAINTENANCE)
+ * @param {Array<{id: number, name: string}>} options.downFlaggedChildren Pre-loaded list of flagged children currently DOWN (used when this monitor is the root of an incident)
  * @returns {Promise<object>}
  */
 async function handleDown(monitor, options = {}) {
@@ -416,13 +427,12 @@ async function handleDown(monitor, options = {}) {
  * Decide what to do when a monitor transitions to UP.
  *
  * Returns one of:
- *   { send: "standard" }                                         — no grouping; standard UP
- *   { send: "incident-resolved", rootMonitor, stillAffectedIds } — root recovered; send consolidated UP mentioning still-affected children
- *   { send: "suppress" }                                          — affected child recovered before root; suppressed
- *
+ * { send: "standard" }                                         — no grouping; standard UP
+ * { send: "incident-resolved", rootMonitor, stillAffectedIds } — root recovered; send consolidated UP mentioning still-affected children
+ * { send: "suppress" }                                          — affected child recovered before root; suppressed
  * @param {object} monitor
- * @param {object} [options]
- * @param {Map<number, number>} [options.statusByMonitorId] Optional pre-loaded map of monitor ID → most recent heartbeat status. Used to skip the DB lookup in tests and by callers that already have statuses loaded.
+ * @param {object} options
+ * @param {Map<number, number>} options.statusByMonitorId Optional pre-loaded map of monitor ID → most recent heartbeat status. Used to skip the DB lookup in tests and by callers that already have statuses loaded.
  * @returns {Promise<object>}
  */
 async function handleUp(monitor, options = {}) {
@@ -469,6 +479,7 @@ async function handleUp(monitor, options = {}) {
  * path, we want the message to keep mentioning the affected list. The
  * caller passes the parent's notification context; this helper returns
  * the updated affected IDs (empty if the incident has been cleared).
+ * @param rootMonitorId
  */
 function getActiveAffectedForRoot(rootMonitorId) {
     return getAffectedIds(rootMonitorId);
@@ -479,19 +490,18 @@ function getActiveAffectedForRoot(rootMonitorId) {
  *
  * Layout (matches user's spec):
  *
- *   🔴 Incident detected
+ * 🔴 Incident detected
  *
- *   Root cause:
- *   PostgreSQL unavailable
+ * Root cause:
+ * PostgreSQL unavailable
  *
- *   Affected services:
- *   • API
- *   • Website
- *   • Payment service
+ * Affected services:
+ * • API
+ * • Website
+ * • Payment service
  *
- *   Notifications suppressed:
- *   3 duplicate alerts
- *
+ * Notifications suppressed:
+ * 3 duplicate alerts
  * @param {string} rootName Name of root-cause monitor
  * @param {string} rootMsg  Heartbeat message from root (e.g. "timeout by AbortSignal")
  * @param {Array<{name: string}>} affectedMonitors List of affected child monitors (without root)
@@ -517,6 +527,8 @@ function formatIncidentDownMessage(rootName, rootMsg, affectedMonitors) {
 
 /**
  * Format the consolidated UP/recovery message body for an incident.
+ * @param rootName
+ * @param stillAffectedMonitors
  */
 function formatIncidentUpMessage(rootName, stillAffectedMonitors) {
     const lines = [
