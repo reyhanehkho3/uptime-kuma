@@ -10,6 +10,9 @@ require.cache[require.resolve("redbean-node")] = {
 const IncidentTracker = require("../../server/incident-tracker");
 const { UP, DOWN, PENDING, MAINTENANCE } = require("../../src/util");
 
+/**
+ * @param overrides
+ */
 function makeMonitor(overrides = {}) {
     return {
         id: 100,

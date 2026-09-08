@@ -77,7 +77,7 @@ const rootCertificates = rootCertificatesFingerprints();
 // Slow-ping alert thresholds. When a monitor's response time stays above
 // SLOW_PING_THRESHOLD_MS continuously for SLOW_PING_DURATION_MS or longer,
 // a notification is sent through the monitor's configured notification list.
-// A second notification is sent when the response time drops back below the
+// A second notification is sent when the response time drops back to a normal range
 // threshold.
 const SLOW_PING_THRESHOLD_MS = 1000;
 const SLOW_PING_DURATION_MS = 5 * 60 * 1000;
@@ -500,6 +500,19 @@ class Monitor extends BeanModel {
             log.debug(
                 "monitor",
                 `[${this.name}] Restored slow-ping state: start=${state.slowPingStart} alertSent=${state.slowPingAlertSent}`
+            );
+        }
+
+        // Restore persisted down-escalation state from the DB columns.
+        // Without this, server restarts mid-escalation silently reset the
+        // timer and re-fired already-delivered level-1/level-2 notifications.
+        if (this.downStart != null || this.downAlertLevel > 0) {
+            const downSt = getDownState(this.id);
+            downSt.downStart = this.downStart != null ? Number(this.downStart) : null;
+            downSt.downAlertLevel = Number(this.downAlertLevel) || 0;
+            log.debug(
+                "monitor",
+                `[${this.name}] Restored down-escalation state: start=${downSt.downStart} level=${downSt.downAlertLevel}`
             );
         }
 
@@ -1338,6 +1351,14 @@ class Monitor extends BeanModel {
         clearTimeout(this.heartbeatInterval);
         this.isStop = true;
 
+        // Cancel any pending deferred DOWN notification so we don't send a
+        // stray alert after the monitor is stopped.
+        const pending = pendingDeferredNotifications.get(this.id);
+        if (pending) {
+            clearTimeout(pending.timer);
+            pendingDeferredNotifications.delete(this.id);
+        }
+
         this.prometheus?.remove();
     }
 
@@ -1654,12 +1675,40 @@ class Monitor extends BeanModel {
                 try {
                     const cfg = JSON.parse(n.config || "{}");
                     // if escalationLevel is not set, treat as legacy -> include
-                    if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) return true;
-                    return Number(cfg.escalationLevel) === 1;
+                    if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) {
+                        return true;
+                    }
+                    const lvl = Number(cfg.escalationLevel);
+                    // Defensive validation: only {1,2,3} are valid escalation
+                    // tiers. Anything else (1.5, "foo", NaN, -1) is silently
+                    // excluded from every tier today; warn and fall back to
+                    // legacy/immediate so the user still receives the alert.
+                    if (!Number.isInteger(lvl) || lvl < 1 || lvl > 3) {
+                        log.warn(
+                            "monitor",
+                            `[${monitor.name}] Notification ${n.name} has invalid ` +
+                                `escalationLevel=${JSON.stringify(cfg.escalationLevel)}; ` +
+                                `treating as legacy/immediate.`
+                        );
+                        return true;
+                    }
+                    return lvl === 1;
                 } catch (e) {
                     return true;
                 }
             });
+        }
+
+        // If checkDownEscalation already sent a "✅ Recovered" message for
+        // this UP beat, skip the plain "✅ Up" to avoid duplicate recovery
+        // notifications. The recovery message carries the same info plus
+        // the recovery duration.
+        if (bean.status === UP && getDownState(monitor.id).recoveryFired) {
+            log.debug(
+                "monitor",
+                `[${monitor.name}] Skipping standard UP notification — recovery summary already sent by checkDownEscalation`
+            );
+            return;
         }
 
         let text;
@@ -1670,6 +1719,14 @@ class Monitor extends BeanModel {
         }
 
         let msg = `[${monitor.name}] [${text}] ${bean.msg}`;
+
+        // When this monitor is the root of an active incident, append the
+        // affected services list to the message. The list grows as more
+        // children fold in over time, so each DOWN (or resend) reflects
+        // the current blast radius.
+        if (bean.status === DOWN) {
+            msg = await Monitor.appendIncidentAffectedToMessage(monitor, msg);
+        }
 
         const heartbeatJSON = await bean.toJSONAsync({ decodeResponse: true });
         // Prevent if the msg is undefined, notifications such as Discord cannot send out.
@@ -1722,11 +1779,10 @@ class Monitor extends BeanModel {
      * Tracks pending deferred notifications per monitor so duplicate
      * DOWN beats on the same monitor do not schedule overlapping fires
      * (the latest defer window supersedes earlier ones).
-     *
      * @param {Monitor} monitor The monitor whose DOWN was deferred
      * @param {import("./heartbeat")} bean Heartbeat that triggered the original DOWN
      * @param {{rootMonitor: object, deferMs: number}} decision Decision from IncidentTracker.handleDown
-     * @param {number} [deferCount=0] How many times this notification has
+     * @param {number} deferCount How many times this notification has
      * already been re-deferred waiting for the parent's status
      * @returns {Promise<void>}
      */
@@ -1835,7 +1891,9 @@ class Monitor extends BeanModel {
         return fullNotificationList.filter((n) => {
             try {
                 const cfg = JSON.parse(n.config || "{}");
-                if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) return true;
+                if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) {
+                    return true;
+                }
                 return Number(cfg.escalationLevel) === 1;
             } catch (e) {
                 return true;
@@ -1942,7 +2000,9 @@ class Monitor extends BeanModel {
      */
     static clearDownEscalationState(monitorID) {
         const state = downState.get(monitorID);
-        if (!state) return;
+        if (!state) {
+            return;
+        }
         state.downStart = null;
         state.downAlertLevel = 0;
     }
@@ -2052,7 +2112,7 @@ class Monitor extends BeanModel {
         if (overThreshold) {
             if (state.slowPingStart === null) {
                 state.slowPingStart = Date.now();
-                Monitor._persistSlowPingState(monitor, state);
+                await Monitor._persistSlowPingState(monitor, state);
             }
             if (
                 !state.slowPingAlertSent &&
@@ -2060,10 +2120,10 @@ class Monitor extends BeanModel {
             ) {
                 await Monitor.sendSlowPingNotification(monitor, bean, false);
                 state.slowPingAlertSent = true;
-                Monitor._persistSlowPingState(monitor, state);
+                await Monitor._persistSlowPingState(monitor, state);
             }
         } else {
-            // Ping dropped back below threshold. If we previously alerted,
+            // Ping dropped back to normal range. If we previously alerted,
             // send a single recovery notification, then clear state.
             if (state.slowPingAlertSent) {
                 await Monitor.sendSlowPingNotification(monitor, bean, true);
@@ -2071,7 +2131,7 @@ class Monitor extends BeanModel {
             if (state.slowPingStart !== null || state.slowPingAlertSent) {
                 state.slowPingStart = null;
                 state.slowPingAlertSent = false;
-                Monitor._persistSlowPingState(monitor, state);
+                await Monitor._persistSlowPingState(monitor, state);
             }
         }
     }
@@ -2130,8 +2190,12 @@ class Monitor extends BeanModel {
      */
     static async checkDownEscalation(monitor, bean) {
         // Don't escalate for paused monitors or when under maintenance
-        if (!monitor.active) return;
-        if (bean.status === MAINTENANCE) return;
+        if (!monitor.active) {
+            return;
+        }
+        if (bean.status === MAINTENANCE) {
+            return;
+        }
 
         // If this monitor is folded into an active incident as an affected
         // child, the root cause's escalation chain carries it — skip our own.
@@ -2144,7 +2208,10 @@ class Monitor extends BeanModel {
         const state = getDownState(monitor.id);
         const notificationList = await Monitor.getNotificationList(monitor);
 
-        // Helper: filter by escalation level where undefined = legacy (treat as immediate)
+        // Helper: filter by escalation level where undefined = legacy (treat as immediate).
+        // Includes defensive validation: malformed escalationLevel values
+        // (1.5, "foo", NaN, -1) are warned and fall back to legacy/immediate
+        // so the user is never silently dropped from all tiers.
         const filterByLevel = (list, level) => {
             return list.filter((n) => {
                 try {
@@ -2155,7 +2222,17 @@ class Monitor extends BeanModel {
                         // later tech-lead/admin escalations.
                         return level === 1;
                     }
-                    return Number(cfg.escalationLevel) === level;
+                    const lvl = Number(cfg.escalationLevel);
+                    if (!Number.isInteger(lvl) || lvl < 1 || lvl > 3) {
+                        log.warn(
+                            "monitor",
+                            `[${monitor.name}] Notification ${n.name} has invalid ` +
+                                `escalationLevel=${JSON.stringify(cfg.escalationLevel)}; ` +
+                                `treating as legacy/immediate.`
+                        );
+                        return level === 1;
+                    }
+                    return lvl === level;
                 } catch (e) {
                     return level === 1;
                 }
@@ -2232,22 +2309,36 @@ class Monitor extends BeanModel {
                 const recipients = notificationList.filter((n) => {
                     try {
                         const cfg = JSON.parse(n.config || "{}");
-                        if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) return true;
-                        return Number(cfg.escalationLevel) <= state.downAlertLevel;
+                        if (cfg.escalationLevel === undefined || cfg.escalationLevel === null) {
+                            return true;
+                        }
+                        const lvl = Number(cfg.escalationLevel);
+                        if (!Number.isInteger(lvl) || lvl < 1 || lvl > 3) {
+                            return true;
+                        }
+                        return lvl <= state.downAlertLevel;
                     } catch (e) {
                         return true;
                     }
                 });
 
+                // Mark that the recovery branch fired so sendStandardNotification's
+                // UP path can skip the duplicate plain "✅ Up" message.
+                state.recoveryFired = true;
+
                 const msg = `[${monitor.name}] [✅ Recovered] Service recovered after ${state.downStart ? Math.round((Date.now() - state.downStart)/1000) : "N/A"}s`;
                 await Monitor.dispatchNotifications(monitor, recipients, msg, heartbeatJSON);
             }
 
-            // Clear state
-            if (state.downStart !== null || state.downAlertLevel !== 0) {
-                state.downStart = null;
-                state.downAlertLevel = 0;
-                await Monitor._persistDownState(monitor, state);
+            // Clear state — also reset the recoveryFired coordination flag so
+            // the next UP beat (if any) doesn't accidentally skip its standard
+            // notification.
+            if (state.downStart !== null || state.downAlertLevel !== 0 || state.recoveryFired) {
+                const st = getDownState(monitor.id);
+                st.downStart = null;
+                st.downAlertLevel = 0;
+                st.recoveryFired = false;
+                await Monitor._persistDownState(monitor, st);
             }
         }
     }
@@ -2285,7 +2376,7 @@ class Monitor extends BeanModel {
 
         const header = isRecovered ? "✅ Slow Response Resolved" : "⚠️ Slow Response — not down, just slow";
         const detail = isRecovered
-            ? `Response time is back below ${SLOW_PING_THRESHOLD_MS} ms (current: ${bean.ping} ms)`
+            ? `Response time is back at or below ${SLOW_PING_THRESHOLD_MS} ms (current: ${bean.ping} ms)`
             : `Response time has exceeded ${SLOW_PING_THRESHOLD_MS} ms continuously for over 5 minutes (current: ${bean.ping} ms)`;
 
         const msg = `[${monitor.name}] [${header}] ${detail}`;

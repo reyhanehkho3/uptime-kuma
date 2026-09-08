@@ -18,7 +18,6 @@ const MAX_CANDIDATES = 50;
  * the monitor was paused, or beats simply stopped) is treated as "no
  * data" and excluded, instead of being silently attributed to the
  * monitored service.
- *
  * @param {Array<{status: number, time: string}>} transitions Important
  * heartbeats (status UP or DOWN) sorted ascending by time. `time` uses the
  * SQL datetime format ("YYYY-MM-DD HH:mm:ss.SSS"), which compares
@@ -28,7 +27,7 @@ const MAX_CANDIDATES = 50;
  * @param {(downTime: string, endTime: string) => Promise<Array<{time: string}>>} options.loadInnerBeats
  * Returns ALL stored beats for the monitor strictly between the two given
  * times, ascending.
- * @param {number} [options.nowMs] Current time, used as the end bound for
+ * @param {number} options.nowMs Current time, used as the end bound for
  * an outage that is still ongoing. Defaults to Date.now(). Injectable for
  * deterministic tests.
  * @returns {Promise<number>} Longest downtime in seconds (0 if none).

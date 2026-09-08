@@ -11,6 +11,7 @@ class Teams extends NotificationProvider {
      * @param {const} status The status constant
      * @param {string} monitorName Name of monitor
      * @param {boolean} withStatusSymbol If the status should be prepended as symbol
+     * @param heartbeatJSON
      * @returns {string} Status message
      */
     _statusMessageFactory = (status, monitorName, withStatusSymbol, heartbeatJSON = null) => {
@@ -28,6 +29,7 @@ class Teams extends NotificationProvider {
     /**
      * Select the style to use based on status
      * @param {const} status The status constant
+     * @param heartbeatJSON
      * @returns {string} Selected style for adaptive cards
      */
     _getStyle = (status, heartbeatJSON = null) => {
